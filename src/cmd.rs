@@ -3218,7 +3218,7 @@ mod tests {
             vec![b"WATCH", b"key"],
             vec![b"UNWATCH"],
         ] {
-            let out = exec_str(&store, &cmd);
+            let out = exec_str(&store, cmd);
             assert!(
                 out.contains("ERR unknown command"),
                 "cmd {:?} should be unknown: {out}",

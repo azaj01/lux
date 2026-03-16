@@ -1,0 +1,11 @@
+#!/bin/sh
+
+if ! cargo fmt --check > /dev/null 2>&1; then
+    echo "cargo fmt check failed. Run 'cargo fmt' and try again."
+    exit 1
+fi
+
+if ! cargo clippy --all-targets -- -D warnings > /dev/null 2>&1; then
+    echo "cargo clippy found warnings. Fix them and try again."
+    exit 1
+fi

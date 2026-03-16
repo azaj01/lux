@@ -10,7 +10,17 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+
   build-amd64:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,6 +54,7 @@ jobs:
           path: /tmp/digest-amd64.txt
 
   build-arm64:
+    needs: test
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read

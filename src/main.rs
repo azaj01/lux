@@ -8,12 +8,12 @@ use bytes::BytesMut;
 use cmd::CmdResult;
 use pubsub::Broker;
 use resp::Parser;
-use store::Store;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
+use store::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -35,7 +35,7 @@ async fn main() -> std::io::Result<()> {
     let store = Arc::new(Store::new());
     let broker = Broker::new();
 
-    let require_auth = std::env::var("LUX_PASSWORD").map_or(false, |p| !p.is_empty());
+    let require_auth = std::env::var("LUX_PASSWORD").is_ok_and(|p| !p.is_empty());
 
     match snapshot::load(&store) {
         Ok(0) => println!("no snapshot found"),
@@ -79,7 +79,10 @@ async fn main() -> std::io::Result<()> {
 #[inline(always)]
 fn cmd_eq_fast(input: &[u8], expected: &[u8]) -> bool {
     input.len() == expected.len()
-        && input.iter().zip(expected).all(|(a, b)| a.to_ascii_uppercase() == *b)
+        && input
+            .iter()
+            .zip(expected)
+            .all(|(a, b)| a.to_ascii_uppercase() == *b)
 }
 
 async fn handle_connection(
@@ -193,23 +196,29 @@ async fn handle_connection(
 
             let mut commands: Vec<Vec<&[u8]>> = Vec::new();
             while let Ok(Some(args)) = parser.parse_command() {
-                if args.is_empty() { continue; }
+                if args.is_empty() {
+                    continue;
+                }
                 commands.push(args);
             }
             let consumed = parser.pos();
 
             if commands.len() <= 1 {
                 for args in &commands {
-                    if !authenticated {
-                        if !cmd_eq_fast(args[0], b"AUTH") && !cmd_eq_fast(args[0], b"PING") && !cmd_eq_fast(args[0], b"QUIT") {
-                            resp::write_error(&mut write_buf, "NOAUTH Authentication required");
-                            continue;
-                        }
+                    if !authenticated
+                        && !cmd_eq_fast(args[0], b"AUTH")
+                        && !cmd_eq_fast(args[0], b"PING")
+                        && !cmd_eq_fast(args[0], b"QUIT")
+                    {
+                        resp::write_error(&mut write_buf, "NOAUTH Authentication required");
+                        continue;
                     }
                     TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
                     match cmd::execute(&store, &broker, args, &mut write_buf, now) {
                         CmdResult::Written => {}
-                        CmdResult::Authenticated => { authenticated = true; }
+                        CmdResult::Authenticated => {
+                            authenticated = true;
+                        }
                         CmdResult::Subscribe { channels } => {
                             for ch in &channels {
                                 let rx = broker.subscribe(ch).await;
@@ -235,21 +244,36 @@ async fn handle_connection(
                 let mut has_special = false;
                 let mut all_single_key_rw = true;
                 for args in &commands {
-                    if !authenticated && !cmd_eq_fast(args[0], b"AUTH") && !cmd_eq_fast(args[0], b"PING") && !cmd_eq_fast(args[0], b"QUIT") {
+                    if !authenticated
+                        && !cmd_eq_fast(args[0], b"AUTH")
+                        && !cmd_eq_fast(args[0], b"PING")
+                        && !cmd_eq_fast(args[0], b"QUIT")
+                    {
                         has_special = true;
                         break;
                     }
-                    if cmd_eq_fast(args[0], b"SUBSCRIBE") || cmd_eq_fast(args[0], b"PUBLISH") || cmd_eq_fast(args[0], b"AUTH") {
+                    if cmd_eq_fast(args[0], b"SUBSCRIBE")
+                        || cmd_eq_fast(args[0], b"PUBLISH")
+                        || cmd_eq_fast(args[0], b"AUTH")
+                    {
                         has_special = true;
                         break;
                     }
-                    if args.len() < 2 || cmd_eq_fast(args[0], b"MGET") || cmd_eq_fast(args[0], b"MSET")
-                        || cmd_eq_fast(args[0], b"DEL") || cmd_eq_fast(args[0], b"EXISTS")
-                        || cmd_eq_fast(args[0], b"KEYS") || cmd_eq_fast(args[0], b"SCAN")
-                        || cmd_eq_fast(args[0], b"FLUSHDB") || cmd_eq_fast(args[0], b"FLUSHALL")
-                        || cmd_eq_fast(args[0], b"DBSIZE") || cmd_eq_fast(args[0], b"SAVE")
-                        || cmd_eq_fast(args[0], b"INFO") || cmd_eq_fast(args[0], b"RENAME")
-                        || cmd_eq_fast(args[0], b"SUNION") || cmd_eq_fast(args[0], b"SINTER")
+                    if args.len() < 2
+                        || cmd_eq_fast(args[0], b"MGET")
+                        || cmd_eq_fast(args[0], b"MSET")
+                        || cmd_eq_fast(args[0], b"DEL")
+                        || cmd_eq_fast(args[0], b"EXISTS")
+                        || cmd_eq_fast(args[0], b"KEYS")
+                        || cmd_eq_fast(args[0], b"SCAN")
+                        || cmd_eq_fast(args[0], b"FLUSHDB")
+                        || cmd_eq_fast(args[0], b"FLUSHALL")
+                        || cmd_eq_fast(args[0], b"DBSIZE")
+                        || cmd_eq_fast(args[0], b"SAVE")
+                        || cmd_eq_fast(args[0], b"INFO")
+                        || cmd_eq_fast(args[0], b"RENAME")
+                        || cmd_eq_fast(args[0], b"SUNION")
+                        || cmd_eq_fast(args[0], b"SINTER")
                         || cmd_eq_fast(args[0], b"SDIFF")
                     {
                         all_single_key_rw = false;
@@ -258,15 +282,19 @@ async fn handle_connection(
 
                 if has_special || !all_single_key_rw {
                     for args in &commands {
-                        if !authenticated {
-                            if !cmd_eq_fast(args[0], b"AUTH") && !cmd_eq_fast(args[0], b"PING") && !cmd_eq_fast(args[0], b"QUIT") {
-                                resp::write_error(&mut write_buf, "NOAUTH Authentication required");
-                                continue;
-                            }
+                        if !authenticated
+                            && !cmd_eq_fast(args[0], b"AUTH")
+                            && !cmd_eq_fast(args[0], b"PING")
+                            && !cmd_eq_fast(args[0], b"QUIT")
+                        {
+                            resp::write_error(&mut write_buf, "NOAUTH Authentication required");
+                            continue;
                         }
                         match cmd::execute(&store, &broker, args, &mut write_buf, now) {
                             CmdResult::Written => {}
-                            CmdResult::Authenticated => { authenticated = true; }
+                            CmdResult::Authenticated => {
+                                authenticated = true;
+                            }
                             CmdResult::Subscribe { channels } => {
                                 for ch in &channels {
                                     let rx = broker.subscribe(ch).await;
@@ -310,9 +338,9 @@ async fn handle_connection(
                         });
 
                         if all_simple {
-                            let has_writes = sorted[batch_start..batch_end].iter().any(|&(_, ci)| {
-                                cmd_eq_fast(commands[ci as usize][0], b"SET")
-                            });
+                            let has_writes = sorted[batch_start..batch_end]
+                                .iter()
+                                .any(|&(_, ci)| cmd_eq_fast(commands[ci as usize][0], b"SET"));
                             if has_writes {
                                 let mut shard = store.lock_write_shard(shard_idx as usize);
                                 for &(_, ci) in &sorted[batch_start..batch_end] {
@@ -320,10 +348,21 @@ async fn handle_connection(
                                     let args = &commands[idx];
                                     let start = scratch.len() as u32;
                                     if cmd_eq_fast(args[0], b"SET") {
-                                        Store::set_on_shard(&mut shard.data, args[1], args[2], None, now);
+                                        Store::set_on_shard(
+                                            &mut shard.data,
+                                            args[1],
+                                            args[2],
+                                            None,
+                                            now,
+                                        );
                                         scratch.extend_from_slice(resp::OK);
                                     } else {
-                                        Store::get_and_write(&shard.data, args[1], now, &mut scratch);
+                                        Store::get_and_write(
+                                            &shard.data,
+                                            args[1],
+                                            now,
+                                            &mut scratch,
+                                        );
                                     }
                                     resp_spans[idx] = (start, scratch.len() as u32);
                                 }
@@ -332,7 +371,12 @@ async fn handle_connection(
                                 for &(_, ci) in &sorted[batch_start..batch_end] {
                                     let idx = ci as usize;
                                     let start = scratch.len() as u32;
-                                    Store::get_and_write(&shard.data, commands[idx][1], now, &mut scratch);
+                                    Store::get_and_write(
+                                        &shard.data,
+                                        commands[idx][1],
+                                        now,
+                                        &mut scratch,
+                                    );
                                     resp_spans[idx] = (start, scratch.len() as u32);
                                 }
                             }

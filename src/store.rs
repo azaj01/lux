@@ -39,11 +39,10 @@ pub fn num_shards() -> usize {
                 let cpus = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4);
-                (cpus * 16).next_power_of_two().max(16).min(1024)
+                (cpus * 16).next_power_of_two().clamp(16, 1024)
             })
     })
 }
-pub const MAX_SHARDS: usize = 1024;
 
 pub enum StoreValue {
     Str(Bytes),
@@ -71,7 +70,7 @@ pub struct Entry {
 impl Entry {
     #[inline(always)]
     pub fn is_expired_at(&self, now: Instant) -> bool {
-        self.expires_at.map_or(false, |exp| now > exp)
+        self.expires_at.is_some_and(|exp| now > exp)
     }
 }
 
@@ -141,10 +140,16 @@ impl Store {
     }
 
     #[inline(always)]
-    pub fn get_from_shard(data: &HashMap<String, Entry, FxBuildHasher>, key: &[u8], now: Instant) -> Option<Bytes> {
+    pub fn get_from_shard(
+        data: &HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        now: Instant,
+    ) -> Option<Bytes> {
         let ks = key_str(key);
         data.get(ks).and_then(|entry| {
-            if entry.is_expired_at(now) { return None; }
+            if entry.is_expired_at(now) {
+                return None;
+            }
             match &entry.value {
                 StoreValue::Str(s) => Some(s.clone()),
                 _ => None,
@@ -153,7 +158,12 @@ impl Store {
     }
 
     #[inline(always)]
-    pub fn get_and_write(data: &HashMap<String, Entry, FxBuildHasher>, key: &[u8], now: Instant, out: &mut bytes::BytesMut) {
+    pub fn get_and_write(
+        data: &HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        now: Instant,
+        out: &mut bytes::BytesMut,
+    ) {
         let ks = key_str(key);
         match data.get(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
@@ -168,17 +178,26 @@ impl Store {
     }
 
     #[inline(always)]
-    pub fn set_on_shard(data: &mut HashMap<String, Entry, FxBuildHasher>, key: &[u8], value: &[u8], ttl: Option<Duration>, now: Instant) {
+    pub fn set_on_shard(
+        data: &mut HashMap<String, Entry, FxBuildHasher>,
+        key: &[u8],
+        value: &[u8],
+        ttl: Option<Duration>,
+        now: Instant,
+    ) {
         let expires_at = ttl.map(|d| now + d);
         let ks = key_string(key);
         if let Some(entry) = data.get_mut(&ks) {
             entry.value = StoreValue::Str(Bytes::copy_from_slice(value));
             entry.expires_at = expires_at;
         } else {
-            data.insert(ks, Entry {
-                value: StoreValue::Str(Bytes::copy_from_slice(value)),
-                expires_at,
-            });
+            data.insert(
+                ks,
+                Entry {
+                    value: StoreValue::Str(Bytes::copy_from_slice(value)),
+                    expires_at,
+                },
+            );
         }
     }
 
@@ -291,12 +310,11 @@ impl Store {
         let (current, expires_at) = match shard.data.get(ks) {
             Some(e) if !e.is_expired_at(now) => match &e.value {
                 StoreValue::Str(s) => {
-                    let s = std::str::from_utf8(s).map_err(|_| {
-                        "ERR value is not an integer or out of range".to_string()
-                    })?;
-                    let n = s.parse::<i64>().map_err(|_| {
-                        "ERR value is not an integer or out of range".to_string()
-                    })?;
+                    let s = std::str::from_utf8(s)
+                        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+                    let n = s
+                        .parse::<i64>()
+                        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
                     (n, e.expires_at)
                 }
                 _ => {
@@ -354,7 +372,7 @@ impl Store {
         for shard in self.shards.iter() {
             let shard = shard.read();
             for (k, e) in shard.data.iter() {
-                if e.expires_at.map_or(true, |exp| now < exp) && matcher.matches(k) {
+                if e.expires_at.is_none_or(|exp| now < exp) && matcher.matches(k) {
                     result.push(k.clone());
                 }
             }
@@ -362,7 +380,13 @@ impl Store {
         result
     }
 
-    pub fn scan(&self, cursor: usize, pattern: &[u8], count: usize, now: Instant) -> (usize, Vec<String>) {
+    pub fn scan(
+        &self,
+        cursor: usize,
+        pattern: &[u8],
+        count: usize,
+        now: Instant,
+    ) -> (usize, Vec<String>) {
         let all_keys = self.keys(pattern, now);
         let start = cursor.min(all_keys.len());
         let end = (start + count).min(all_keys.len());
@@ -378,7 +402,11 @@ impl Store {
             Some(entry) => match entry.expires_at {
                 None => -1,
                 Some(exp) => {
-                    if now > exp { -2 } else { exp.duration_since(now).as_secs() as i64 }
+                    if now > exp {
+                        -2
+                    } else {
+                        exp.duration_since(now).as_secs() as i64
+                    }
                 }
             },
         }
@@ -392,7 +420,11 @@ impl Store {
             Some(entry) => match entry.expires_at {
                 None => -1,
                 Some(exp) => {
-                    if now > exp { -2 } else { exp.duration_since(now).as_millis() as i64 }
+                    if now > exp {
+                        -2
+                    } else {
+                        exp.duration_since(now).as_millis() as i64
+                    }
                 }
             },
         }
@@ -453,7 +485,11 @@ impl Store {
         let mut total = 0i64;
         for shard in self.shards.iter() {
             let shard = shard.read();
-            total += shard.data.values().filter(|e| e.expires_at.map_or(true, |exp| now < exp)).count() as i64;
+            total += shard
+                .data
+                .values()
+                .filter(|e| e.expires_at.is_none_or(|exp| now < exp))
+                .count() as i64;
         }
         total
     }
@@ -479,10 +515,14 @@ impl Store {
         }
         match &mut entry.value {
             StoreValue::List(list) => {
-                for v in values { list.push_front(Bytes::copy_from_slice(v)); }
+                for v in values {
+                    list.push_front(Bytes::copy_from_slice(v));
+                }
                 Ok(list.len() as i64)
             }
-            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
         }
     }
 
@@ -500,10 +540,14 @@ impl Store {
         }
         match &mut entry.value {
             StoreValue::List(list) => {
-                for v in values { list.push_back(Bytes::copy_from_slice(v)); }
+                for v in values {
+                    list.push_back(Bytes::copy_from_slice(v));
+                }
                 Ok(list.len() as i64)
             }
-            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
         }
     }
 
@@ -537,24 +581,46 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::List(list) => Ok(list.len() as i64),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(0),
         }
     }
 
-    pub fn lrange(&self, key: &[u8], start: i64, stop: i64, now: Instant) -> Result<Vec<Bytes>, String> {
+    pub fn lrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        now: Instant,
+    ) -> Result<Vec<Bytes>, String> {
         let idx = self.shard_index(key);
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::List(list) => {
                     let len = list.len() as i64;
-                    let s = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
-                    let e = if stop < 0 { (len + stop + 1).max(0) as usize } else { (stop + 1).min(len) as usize };
-                    if s >= e { Ok(vec![]) } else { Ok(list.iter().skip(s).take(e - s).cloned().collect()) }
+                    let s = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        start.min(len) as usize
+                    };
+                    let e = if stop < 0 {
+                        (len + stop + 1).max(0) as usize
+                    } else {
+                        (stop + 1).min(len) as usize
+                    };
+                    if s >= e {
+                        Ok(vec![])
+                    } else {
+                        Ok(list.iter().skip(s).take(e - s).cloned().collect())
+                    }
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(vec![]),
         }
@@ -566,7 +632,11 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::List(list) => {
-                    let i = if index < 0 { (list.len() as i64 + index) as usize } else { index as usize };
+                    let i = if index < 0 {
+                        (list.len() as i64 + index) as usize
+                    } else {
+                        index as usize
+                    };
                     list.get(i).cloned()
                 }
                 _ => None,
@@ -591,11 +661,18 @@ impl Store {
             StoreValue::Hash(map) => {
                 let mut added = 0i64;
                 for (field, value) in pairs {
-                    if map.insert(key_string(field), Bytes::copy_from_slice(value)).is_none() { added += 1; }
+                    if map
+                        .insert(key_string(field), Bytes::copy_from_slice(value))
+                        .is_none()
+                    {
+                        added += 1;
+                    }
                 }
                 Ok(added)
             }
-            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
         }
     }
 
@@ -616,7 +693,10 @@ impl Store {
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Hash(map) => fields.iter().map(|f| map.get(key_str(f)).cloned()).collect(),
+                StoreValue::Hash(map) => fields
+                    .iter()
+                    .map(|f| map.get(key_str(f)).cloned())
+                    .collect(),
                 _ => fields.iter().map(|_| None).collect(),
             },
             _ => fields.iter().map(|_| None).collect(),
@@ -630,10 +710,16 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Hash(map) => {
                     let mut removed = 0i64;
-                    for f in fields { if map.remove(key_str(f)).is_some() { removed += 1; } }
+                    for f in fields {
+                        if map.remove(key_str(f)).is_some() {
+                            removed += 1;
+                        }
+                    }
                     Ok(removed)
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(0),
         }
@@ -644,8 +730,12 @@ impl Store {
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Hash(map) => Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                StoreValue::Hash(map) => {
+                    Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(vec![]),
         }
@@ -657,7 +747,9 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => Ok(map.keys().cloned().collect()),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(vec![]),
         }
@@ -669,7 +761,9 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => Ok(map.values().cloned().collect()),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(vec![]),
         }
@@ -681,7 +775,9 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => Ok(map.len() as i64),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(0),
         }
@@ -693,13 +789,21 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Hash(map) => Ok(map.contains_key(key_str(field))),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(false),
         }
     }
 
-    pub fn hincrby(&self, key: &[u8], field: &[u8], delta: i64, now: Instant) -> Result<i64, String> {
+    pub fn hincrby(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        delta: i64,
+        now: Instant,
+    ) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         let ks = key_string(key);
@@ -714,17 +818,23 @@ impl Store {
         match &mut entry.value {
             StoreValue::Hash(map) => {
                 let fs = key_str(field);
-                let current: i64 = map.get(fs)
-                    .map(|v| std::str::from_utf8(v).ok()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .ok_or_else(|| "ERR hash value is not an integer".to_string()))
+                let current: i64 = map
+                    .get(fs)
+                    .map(|v| {
+                        std::str::from_utf8(v)
+                            .ok()
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .ok_or_else(|| "ERR hash value is not an integer".to_string())
+                    })
                     .transpose()?
                     .unwrap_or(0);
                 let new_val = current + delta;
                 map.insert(fs.to_string(), Bytes::from(new_val.to_string()));
                 Ok(new_val)
             }
-            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
         }
     }
 
@@ -743,10 +853,16 @@ impl Store {
         match &mut entry.value {
             StoreValue::Set(set) => {
                 let mut added = 0i64;
-                for m in members { if set.insert(key_string(m)) { added += 1; } }
+                for m in members {
+                    if set.insert(key_string(m)) {
+                        added += 1;
+                    }
+                }
                 Ok(added)
             }
-            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
         }
     }
 
@@ -757,10 +873,16 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::Set(set) => {
                     let mut removed = 0i64;
-                    for m in members { if set.remove(key_str(m)) { removed += 1; } }
+                    for m in members {
+                        if set.remove(key_str(m)) {
+                            removed += 1;
+                        }
+                    }
                     Ok(removed)
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(0),
         }
@@ -772,7 +894,9 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => Ok(set.iter().cloned().collect()),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(vec![]),
         }
@@ -784,7 +908,9 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => Ok(set.contains(key_str(member))),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(false),
         }
@@ -796,7 +922,9 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => Ok(set.len() as i64),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(0),
         }
@@ -808,7 +936,9 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => Ok(set.clone()),
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(HashSet::new()),
         }
@@ -816,21 +946,33 @@ impl Store {
 
     pub fn sunion(&self, keys: &[&[u8]], now: Instant) -> Result<Vec<String>, String> {
         let mut result = HashSet::new();
-        for key in keys { result.extend(self.collect_set(key, now)?); }
+        for key in keys {
+            result.extend(self.collect_set(key, now)?);
+        }
         Ok(result.into_iter().collect())
     }
 
     pub fn sinter(&self, keys: &[&[u8]], now: Instant) -> Result<Vec<String>, String> {
-        if keys.is_empty() { return Ok(vec![]); }
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
         let mut result = self.collect_set(keys[0], now)?;
-        for key in &keys[1..] { let set = self.collect_set(key, now)?; result.retain(|m| set.contains(m)); }
+        for key in &keys[1..] {
+            let set = self.collect_set(key, now)?;
+            result.retain(|m| set.contains(m));
+        }
         Ok(result.into_iter().collect())
     }
 
     pub fn sdiff(&self, keys: &[&[u8]], now: Instant) -> Result<Vec<String>, String> {
-        if keys.is_empty() { return Ok(vec![]); }
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
         let mut result = self.collect_set(keys[0], now)?;
-        for key in &keys[1..] { let set = self.collect_set(key, now)?; result.retain(|m| !set.contains(m)); }
+        for key in &keys[1..] {
+            let set = self.collect_set(key, now)?;
+            result.retain(|m| !set.contains(m));
+        }
         Ok(result.into_iter().collect())
     }
 
@@ -840,7 +982,9 @@ impl Store {
         for shard in self.shards.iter() {
             let shard = shard.read();
             for (key, entry) in shard.data.iter() {
-                if entry.is_expired_at(now) { continue; }
+                if entry.is_expired_at(now) {
+                    continue;
+                }
                 total += key.len() + 64;
                 total += match &entry.value {
                     StoreValue::Str(s) => s.len(),
@@ -858,14 +1002,29 @@ impl Store {
         for shard in self.shards.iter() {
             let shard = shard.read();
             for (key, entry) in shard.data.iter() {
-                if entry.is_expired_at(now) { continue; }
-                let ttl_ms = entry.expires_at.map(|exp| exp.duration_since(now).as_millis() as i64).unwrap_or(0);
+                if entry.is_expired_at(now) {
+                    continue;
+                }
+                let ttl_ms = entry
+                    .expires_at
+                    .map(|exp| exp.duration_since(now).as_millis() as i64)
+                    .unwrap_or(0);
                 entries.push(DumpEntry {
                     key: key.clone(),
                     value: match &entry.value {
-                        StoreValue::Str(s) => DumpValue::Str(String::from_utf8_lossy(s).into_owned()),
-                        StoreValue::List(l) => DumpValue::List(l.iter().map(|b| String::from_utf8_lossy(b).into_owned()).collect()),
-                        StoreValue::Hash(h) => DumpValue::Hash(h.iter().map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned())).collect()),
+                        StoreValue::Str(s) => {
+                            DumpValue::Str(String::from_utf8_lossy(s).into_owned())
+                        }
+                        StoreValue::List(l) => DumpValue::List(
+                            l.iter()
+                                .map(|b| String::from_utf8_lossy(b).into_owned())
+                                .collect(),
+                        ),
+                        StoreValue::Hash(h) => DumpValue::Hash(
+                            h.iter()
+                                .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+                                .collect(),
+                        ),
                         StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
                     },
                     ttl_ms,
@@ -881,11 +1040,19 @@ impl Store {
         let store_value = match value {
             DumpValue::Str(s) => StoreValue::Str(Bytes::from(s)),
             DumpValue::List(l) => StoreValue::List(l.into_iter().map(Bytes::from).collect()),
-            DumpValue::Hash(h) => StoreValue::Hash(h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect()),
+            DumpValue::Hash(h) => {
+                StoreValue::Hash(h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect())
+            }
             DumpValue::Set(s) => StoreValue::Set(s.into_iter().collect()),
         };
         let expires_at = ttl.map(|d| Instant::now() + d);
-        shard.data.insert(key, Entry { value: store_value, expires_at });
+        shard.data.insert(
+            key,
+            Entry {
+                value: store_value,
+                expires_at,
+            },
+        );
     }
 
     pub fn getdel(&self, key: &[u8], now: Instant) -> Option<Bytes> {
@@ -898,20 +1065,31 @@ impl Store {
                     let val = s.clone();
                     shard.data.remove(ks);
                     Some(val)
-                } else { None }
+                } else {
+                    None
+                }
             }
             _ => None,
         }
     }
 
-    pub fn getex(&self, key: &[u8], ttl: Option<Duration>, persist: bool, now: Instant) -> Option<Bytes> {
+    pub fn getex(
+        &self,
+        key: &[u8],
+        ttl: Option<Duration>,
+        persist: bool,
+        now: Instant,
+    ) -> Option<Bytes> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         let ks = key_str(key);
         match shard.data.get_mut(ks) {
             Some(entry) if !entry.is_expired_at(now) => {
-                if persist { entry.expires_at = None; }
-                else if let Some(d) = ttl { entry.expires_at = Some(now + d); }
+                if persist {
+                    entry.expires_at = None;
+                } else if let Some(d) = ttl {
+                    entry.expires_at = Some(now + d);
+                }
                 match &entry.value {
                     StoreValue::Str(s) => Some(s.clone()),
                     _ => None,
@@ -928,10 +1106,24 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => {
                 if let StoreValue::Str(s) = &entry.value {
                     let len = s.len() as i64;
-                    let s_i = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
-                    let e_i = if end < 0 { (len + end).max(-1) as usize + 1 } else { (end + 1).min(len) as usize };
-                    if s_i >= e_i { Bytes::new() } else { s.slice(s_i..e_i) }
-                } else { Bytes::new() }
+                    let s_i = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        start.min(len) as usize
+                    };
+                    let e_i = if end < 0 {
+                        (len + end).max(-1) as usize + 1
+                    } else {
+                        (end + 1).min(len) as usize
+                    };
+                    if s_i >= e_i {
+                        Bytes::new()
+                    } else {
+                        s.slice(s_i..e_i)
+                    }
+                } else {
+                    Bytes::new()
+                }
             }
             _ => Bytes::new(),
         }
@@ -952,17 +1144,23 @@ impl Store {
         if let StoreValue::Str(s) = &entry.value {
             let mut buf = s.to_vec();
             let needed = offset + value.len();
-            if buf.len() < needed { buf.resize(needed, 0); }
+            if buf.len() < needed {
+                buf.resize(needed, 0);
+            }
             buf[offset..offset + value.len()].copy_from_slice(value);
             let len = buf.len() as i64;
             entry.value = StoreValue::Str(Bytes::from(buf));
             len
-        } else { 0 }
+        } else {
+            0
+        }
     }
 
     pub fn msetnx(&self, pairs: &[(&[u8], &[u8])], now: Instant) -> bool {
         for (key, _) in pairs {
-            if self.get(key, now).is_some() { return false; }
+            if self.get(key, now).is_some() {
+                return false;
+            }
         }
         for (key, value) in pairs {
             self.set(key, value, None, now);
@@ -977,7 +1175,9 @@ impl Store {
     pub fn expireat(&self, key: &[u8], timestamp: u64, now: Instant) -> bool {
         let target = std::time::UNIX_EPOCH + Duration::from_secs(timestamp);
         let now_sys = std::time::SystemTime::now();
-        if target <= now_sys { return false; }
+        if target <= now_sys {
+            return false;
+        }
         let dur = target.duration_since(now_sys).unwrap_or(Duration::ZERO);
         self.expire(key, dur.as_secs(), now)
     }
@@ -985,7 +1185,9 @@ impl Store {
     pub fn pexpireat(&self, key: &[u8], timestamp_ms: u64, now: Instant) -> bool {
         let target = std::time::UNIX_EPOCH + Duration::from_millis(timestamp_ms);
         let now_sys = std::time::SystemTime::now();
-        if target <= now_sys { return false; }
+        if target <= now_sys {
+            return false;
+        }
         let dur = target.duration_since(now_sys).unwrap_or(Duration::ZERO);
         self.pexpire(key, dur.as_millis() as u64, now)
     }
@@ -1000,7 +1202,9 @@ impl Store {
                 None => -1,
                 Some(exp) => {
                     let remaining = exp.duration_since(now);
-                    let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
                     (now_unix.as_secs() + remaining.as_secs()) as i64
                 }
             },
@@ -1017,7 +1221,9 @@ impl Store {
                 None => -1,
                 Some(exp) => {
                     let remaining = exp.duration_since(now);
-                    let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
                     (now_unix.as_millis() + remaining.as_millis()) as i64
                 }
             },
@@ -1030,18 +1236,33 @@ impl Store {
         match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
-                    let i = if index < 0 { (list.len() as i64 + index) as usize } else { index as usize };
-                    if i >= list.len() { return Err("ERR index out of range".to_string()); }
+                    let i = if index < 0 {
+                        (list.len() as i64 + index) as usize
+                    } else {
+                        index as usize
+                    };
+                    if i >= list.len() {
+                        return Err("ERR index out of range".to_string());
+                    }
                     list[i] = Bytes::copy_from_slice(value);
                     Ok(())
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Err("ERR no such key".to_string()),
         }
     }
 
-    pub fn linsert(&self, key: &[u8], before: bool, pivot: &[u8], value: &[u8], now: Instant) -> Result<i64, String> {
+    pub fn linsert(
+        &self,
+        key: &[u8],
+        before: bool,
+        pivot: &[u8],
+        value: &[u8],
+        now: Instant,
+    ) -> Result<i64, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         match shard.data.get_mut(key_str(key)) {
@@ -1051,9 +1272,13 @@ impl Store {
                         let insert_at = if before { pos } else { pos + 1 };
                         list.insert(insert_at, Bytes::copy_from_slice(value));
                         Ok(list.len() as i64)
-                    } else { Ok(-1) }
+                    } else {
+                        Ok(-1)
+                    }
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(0),
         }
@@ -1069,21 +1294,37 @@ impl Store {
                     if count > 0 {
                         let mut i = 0;
                         while i < list.len() && removed < count {
-                            if list[i].as_ref() == value { list.remove(i); removed += 1; }
-                            else { i += 1; }
+                            if list[i].as_ref() == value {
+                                list.remove(i);
+                                removed += 1;
+                            } else {
+                                i += 1;
+                            }
                         }
                     } else if count < 0 {
                         let mut i = list.len();
                         while i > 0 && removed < count.abs() {
                             i -= 1;
-                            if list[i].as_ref() == value { list.remove(i); removed += 1; }
+                            if list[i].as_ref() == value {
+                                list.remove(i);
+                                removed += 1;
+                            }
                         }
                     } else {
-                        list.retain(|v| { if v.as_ref() == value { removed += 1; false } else { true } });
+                        list.retain(|v| {
+                            if v.as_ref() == value {
+                                removed += 1;
+                                false
+                            } else {
+                                true
+                            }
+                        });
                     }
                     Ok(removed)
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(0),
         }
@@ -1096,15 +1337,27 @@ impl Store {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
                     let len = list.len() as i64;
-                    let s = if start < 0 { (len + start).max(0) as usize } else { start.min(len) as usize };
-                    let e = if stop < 0 { (len + stop + 1).max(0) as usize } else { (stop + 1).min(len) as usize };
-                    if s >= e { list.clear(); } else {
+                    let s = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        start.min(len) as usize
+                    };
+                    let e = if stop < 0 {
+                        (len + stop + 1).max(0) as usize
+                    } else {
+                        (stop + 1).min(len) as usize
+                    };
+                    if s >= e {
+                        list.clear();
+                    } else {
                         let trimmed: VecDeque<Bytes> = list.drain(s..e).collect();
                         *list = trimmed;
                     }
                     Ok(())
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(()),
         }
@@ -1116,7 +1369,9 @@ impl Store {
         match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
-                    for v in values { list.push_front(Bytes::copy_from_slice(v)); }
+                    for v in values {
+                        list.push_front(Bytes::copy_from_slice(v));
+                    }
                     list.len() as i64
                 }
                 _ => 0,
@@ -1131,7 +1386,9 @@ impl Store {
         match shard.data.get_mut(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                 StoreValue::List(list) => {
-                    for v in values { list.push_back(Bytes::copy_from_slice(v)); }
+                    for v in values {
+                        list.push_back(Bytes::copy_from_slice(v));
+                    }
                     list.len() as i64
                 }
                 _ => 0,
@@ -1140,14 +1397,25 @@ impl Store {
         }
     }
 
-    pub fn lmove(&self, src: &[u8], dst: &[u8], from_left: bool, to_left: bool, now: Instant) -> Option<Bytes> {
+    pub fn lmove(
+        &self,
+        src: &[u8],
+        dst: &[u8],
+        from_left: bool,
+        to_left: bool,
+        now: Instant,
+    ) -> Option<Bytes> {
         let src_idx = self.shard_index(src);
         let val = {
             let mut shard = self.shards[src_idx].write();
             match shard.data.get_mut(key_str(src)) {
                 Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                     StoreValue::List(list) => {
-                        if from_left { list.pop_front() } else { list.pop_back() }
+                        if from_left {
+                            list.pop_front()
+                        } else {
+                            list.pop_back()
+                        }
                     }
                     _ => None,
                 },
@@ -1167,13 +1435,23 @@ impl Store {
                 entry.expires_at = None;
             }
             if let StoreValue::List(list) = &mut entry.value {
-                if to_left { list.push_front(v.clone()); } else { list.push_back(v.clone()); }
+                if to_left {
+                    list.push_front(v.clone());
+                } else {
+                    list.push_back(v.clone());
+                }
             }
         }
         val
     }
 
-    pub fn hsetnx(&self, key: &[u8], field: &[u8], value: &[u8], now: Instant) -> Result<bool, String> {
+    pub fn hsetnx(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+        now: Instant,
+    ) -> Result<bool, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         let ks = key_string(key);
@@ -1188,14 +1466,26 @@ impl Store {
         match &mut entry.value {
             StoreValue::Hash(map) => {
                 let fs = key_str(field);
-                if map.contains_key(fs) { Ok(false) }
-                else { map.insert(fs.to_string(), Bytes::copy_from_slice(value)); Ok(true) }
+                if map.contains_key(fs) {
+                    Ok(false)
+                } else {
+                    map.insert(fs.to_string(), Bytes::copy_from_slice(value));
+                    Ok(true)
+                }
             }
-            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
         }
     }
 
-    pub fn hincrbyfloat(&self, key: &[u8], field: &[u8], delta: f64, now: Instant) -> Result<String, String> {
+    pub fn hincrbyfloat(
+        &self,
+        key: &[u8],
+        field: &[u8],
+        delta: f64,
+        now: Instant,
+    ) -> Result<String, String> {
         let idx = self.shard_index(key);
         let mut shard = self.shards[idx].write();
         let ks = key_string(key);
@@ -1210,10 +1500,14 @@ impl Store {
         match &mut entry.value {
             StoreValue::Hash(map) => {
                 let fs = key_str(field);
-                let current: f64 = map.get(fs)
-                    .map(|v| std::str::from_utf8(v).ok()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .ok_or_else(|| "ERR hash value is not a valid float".to_string()))
+                let current: f64 = map
+                    .get(fs)
+                    .map(|v| {
+                        std::str::from_utf8(v)
+                            .ok()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .ok_or_else(|| "ERR hash value is not a valid float".to_string())
+                    })
                     .transpose()?
                     .unwrap_or(0.0);
                 let new_val = current + delta;
@@ -1221,7 +1515,9 @@ impl Store {
                 map.insert(fs.to_string(), Bytes::from(s.clone()));
                 Ok(s)
             }
-            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
         }
     }
 
@@ -1230,7 +1526,9 @@ impl Store {
         let shard = self.shards[idx].read();
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
-                StoreValue::Hash(map) => map.get(key_str(field)).map(|v| v.len() as i64).unwrap_or(0),
+                StoreValue::Hash(map) => {
+                    map.get(key_str(field)).map(|v| v.len() as i64).unwrap_or(0)
+                }
                 _ => 0,
             },
             _ => 0,
@@ -1245,14 +1543,18 @@ impl Store {
                 StoreValue::Set(set) => {
                     let mut result = Vec::new();
                     for _ in 0..count {
-                        if set.is_empty() { break; }
+                        if set.is_empty() {
+                            break;
+                        }
                         let member = set.iter().next().unwrap().clone();
                         set.remove(&member);
                         result.push(member);
                     }
                     Ok(result)
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(vec![]),
         }
@@ -1264,31 +1566,52 @@ impl Store {
         match shard.data.get(key_str(key)) {
             Some(entry) if !entry.is_expired_at(now) => match &entry.value {
                 StoreValue::Set(set) => {
-                    if count == 0 || set.is_empty() { return Ok(vec![]); }
+                    if count == 0 || set.is_empty() {
+                        return Ok(vec![]);
+                    }
                     let members: Vec<&String> = set.iter().collect();
                     let abs_count = count.unsigned_abs() as usize;
-                    let result: Vec<String> = members.iter().take(abs_count).map(|s| (*s).clone()).collect();
+                    let result: Vec<String> = members
+                        .iter()
+                        .take(abs_count)
+                        .map(|s| (*s).clone())
+                        .collect();
                     Ok(result)
                 }
-                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
             },
             _ => Ok(vec![]),
         }
     }
 
-    pub fn smove(&self, src: &[u8], dst: &[u8], member: &[u8], now: Instant) -> Result<bool, String> {
+    pub fn smove(
+        &self,
+        src: &[u8],
+        dst: &[u8],
+        member: &[u8],
+        now: Instant,
+    ) -> Result<bool, String> {
         let src_idx = self.shard_index(src);
         let removed = {
             let mut shard = self.shards[src_idx].write();
             match shard.data.get_mut(key_str(src)) {
                 Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
                     StoreValue::Set(set) => set.remove(key_str(member)),
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .to_string(),
+                        )
+                    }
                 },
                 _ => false,
             }
         };
-        if !removed { return Ok(false); }
+        if !removed {
+            return Ok(false);
+        }
         let dst_idx = self.shard_index(dst);
         let mut shard = self.shards[dst_idx].write();
         let ks = key_string(dst);
@@ -1301,8 +1624,13 @@ impl Store {
             entry.expires_at = None;
         }
         match &mut entry.value {
-            StoreValue::Set(set) => { set.insert(key_string(member)); Ok(true) }
-            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string()),
+            StoreValue::Set(set) => {
+                set.insert(key_string(member));
+                Ok(true)
+            }
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
         }
     }
 
@@ -1361,12 +1689,16 @@ impl Store {
                 let shard = shard.read();
                 !shard.data.is_empty()
             };
-            if !should_check { continue; }
+            if !should_check {
+                continue;
+            }
 
             let mut shard = shard.write();
-            let keys: Vec<String> = shard.data.keys()
+            let keys: Vec<String> = shard
+                .data
+                .keys()
                 .enumerate()
-                .filter(|(j, _)| (*j + seed + i) % 5 == 0)
+                .filter(|(j, _)| (*j + seed + i).is_multiple_of(5))
                 .take(20)
                 .map(|(_, k)| k.clone())
                 .collect();
@@ -1400,24 +1732,40 @@ struct GlobMatcher {
 
 impl GlobMatcher {
     fn new(pattern: &str) -> Self {
-        Self { pattern: pattern.chars().collect() }
+        Self {
+            pattern: pattern.chars().collect(),
+        }
     }
 
     fn matches(&self, s: &str) -> bool {
-        if self.pattern.len() == 1 && self.pattern[0] == '*' { return true; }
+        if self.pattern.len() == 1 && self.pattern[0] == '*' {
+            return true;
+        }
         let s: Vec<char> = s.chars().collect();
         Self::do_match(&self.pattern, &s, 0, 0)
     }
 
     fn do_match(pattern: &[char], s: &[char], pi: usize, si: usize) -> bool {
-        if pi == pattern.len() && si == s.len() { return true; }
-        if pi == pattern.len() { return false; }
-        if pattern[pi] == '*' {
-            for i in si..=s.len() { if Self::do_match(pattern, s, pi + 1, i) { return true; } }
+        if pi == pattern.len() && si == s.len() {
+            return true;
+        }
+        if pi == pattern.len() {
             return false;
         }
-        if si == s.len() { return false; }
-        if pattern[pi] == '?' || pattern[pi] == s[si] { return Self::do_match(pattern, s, pi + 1, si + 1); }
+        if pattern[pi] == '*' {
+            for i in si..=s.len() {
+                if Self::do_match(pattern, s, pi + 1, i) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if si == s.len() {
+            return false;
+        }
+        if pattern[pi] == '?' || pattern[pi] == s[si] {
+            return Self::do_match(pattern, s, pi + 1, si + 1);
+        }
         false
     }
 }

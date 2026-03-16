@@ -131,6 +131,15 @@ rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 rdb.Set(ctx, "hello", "world", 0)
 ```
 
+## Development
+
+Before submitting changes, run `cargo fmt` to auto-format your code and `cargo clippy` to catch common issues:
+
+```bash
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
 ## Supported Commands
 
 **Strings:** `SET` `GET` `SETNX` `SETEX` `PSETEX` `GETSET` `MGET` `MSET` `STRLEN` `APPEND` `INCR` `DECR` `INCRBY` `DECRBY`

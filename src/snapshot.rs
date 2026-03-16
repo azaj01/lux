@@ -41,7 +41,11 @@ pub fn save(store: &Store) -> io::Result<usize> {
                 .join("\x1f"),
             DumpValue::Set(members) => members.join("\x1f"),
         };
-        writeln!(file, "{}\t{}\t{}\t{}", type_char, entry.key, encoded_value, entry.ttl_ms)?;
+        writeln!(
+            file,
+            "{}\t{}\t{}\t{}",
+            type_char, entry.key, encoded_value, entry.ttl_ms
+        )?;
     }
     file.sync_all()?;
     fs::rename(&tmp, &path)?;
@@ -63,7 +67,8 @@ pub fn load(store: &Store) -> io::Result<usize> {
             continue;
         }
 
-        if !line.contains('\t') || line.chars().next().map_or(true, |c| !"SLHT".contains(c))
+        if !line.contains('\t')
+            || line.chars().next().is_none_or(|c| !"SLHT".contains(c))
             || line.chars().nth(1) != Some('\t')
         {
             let parts: Vec<&str> = line.splitn(3, '\t').collect();

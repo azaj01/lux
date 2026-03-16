@@ -190,7 +190,10 @@ impl<'a> Parser<'a> {
     fn read_line_int(&mut self) -> Option<i64> {
         let start = self.pos;
         while self.pos < self.buf.len() {
-            if self.buf[self.pos] == b'\r' && self.pos + 1 < self.buf.len() && self.buf[self.pos + 1] == b'\n' {
+            if self.buf[self.pos] == b'\r'
+                && self.pos + 1 < self.buf.len()
+                && self.buf[self.pos + 1] == b'\n'
+            {
                 let line = &self.buf[start..self.pos];
                 self.pos += 2;
                 let s = std::str::from_utf8(line).ok()?;

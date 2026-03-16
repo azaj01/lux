@@ -39,17 +39,20 @@ Point your existing Redis client at Lux. Most workloads just work.
 
 ### Benchmarks
 
-`redis-benchmark`, 50 clients, 1M requests per test. All competitors on the same machine.
+`redis-benchmark`, 50 clients, 1M SET requests per pipeline depth. Sequential runs (one server at a time) on a 32-core Intel i9-14900K, 128GB RAM, Ubuntu 24.04.
 
-| Pipeline | Lux | Redis 7 | Valkey 9 | KeyDB | Lux vs Redis |
-|----------|-----|---------|----------|-------|-------------|
-| 1 | 106K | 110K | 108K | 68K | 0.97x |
-| 16 | 1.49M | 902K | 745K | 930K | **1.65x** |
-| 64 | **4.65M** | 1.50M | 1.16M | 1.41M | **3.10x** |
-| 128 | **7.19M** | 1.73M | 1.30M | 1.46M | **4.16x** |
-| 256 | **10.5M** | 1.88M | 1.41M | 1.35M | **5.59x** |
+| Pipeline | Lux | Redis 8.6.1 | Lux/Redis |
+|----------|-----|-------------|-----------|
+| 1 | 287K | 296K | 0.97x |
+| 16 | 3.89M | 2.47M | **1.58x** |
+| 64 | **10.87M** | 3.30M | **3.29x** |
+| 128 | **15.39M** | 3.52M | **4.37x** |
+| 256 | **20.00M** | 3.58M | **5.58x** |
+| 512 | **20.01M** | 3.50M | **5.72x** |
 
-At pipeline depth 256, Lux hits **10.5 million SET ops/sec**. That's 5.6x faster than Redis. The gap grows with core count and pipeline depth because Lux's shard batching and multi-threading scale with concurrency while Redis hits a single-core ceiling.
+At pipeline depth 256, Lux hits **20 million SET ops/sec** -- 5.6x faster than Redis 8. At low concurrency they're equal. The gap grows with pipeline depth and core count because Lux's shard batching scales across all cores while Redis is bound to one.
+
+Reproduce with `./bench.sh` (requires `redis-server` and `redis-benchmark` in PATH).
 
 ## Lux Cloud
 

@@ -1,8 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-LUX_BENCH_PORT=${LUX_BENCH_PORT:-6390}
-REDIS_BENCH_PORT=${REDIS_BENCH_PORT:-6391}
+BENCH_PORT=${BENCH_PORT:-6390}
 REQUESTS=${BENCH_REQUESTS:-1000000}
 CLIENTS=${BENCH_CLIENTS:-50}
 
@@ -13,8 +12,7 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 cleanup() {
-    [ -n "${LUX_PID:-}" ] && kill "$LUX_PID" 2>/dev/null
-    [ -n "${REDIS_PID:-}" ] && kill "$REDIS_PID" 2>/dev/null
+    [ -n "${SERVER_PID:-}" ] && kill "$SERVER_PID" 2>/dev/null
     [ -n "${TMPDIR_LUX:-}" ] && rm -rf "$TMPDIR_LUX"
     wait 2>/dev/null
 } 2>/dev/null
@@ -69,25 +67,19 @@ if [ ! -f "$LUX_BIN" ]; then
     cargo build --release
 fi
 
+REDIS_VER=$(redis-server --version 2>&1 | head -1 | grep -oE 'v=[0-9]+\.[0-9]+\.[0-9]+' | cut -d= -f2)
+LUX_VER=$(grep '^version' "$SCRIPT_DIR/Cargo.toml" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+
 echo -e "${BOLD}=== Lux Benchmark ===${NC}"
 echo "    redis-benchmark: $(redis-benchmark --version 2>&1 | head -1)"
 echo "    redis-server:    $(redis-server --version 2>&1 | head -1)"
-echo "    lux:             v$(grep '^version' "$SCRIPT_DIR/Cargo.toml" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+echo "    lux:             v${LUX_VER}"
 echo "    requests:        $REQUESTS"
 echo "    clients:         $CLIENTS"
+echo "    mode:            sequential (one server at a time)"
 echo ""
 
-kill_port "$LUX_BENCH_PORT"
-kill_port "$REDIS_BENCH_PORT"
-
-TMPDIR_LUX=$(mktemp -d)
-LUX_PORT=$LUX_BENCH_PORT LUX_SAVE_INTERVAL=0 LUX_DATA_DIR="$TMPDIR_LUX" "$LUX_BIN" >/dev/null 2>&1 &
-LUX_PID=$!
-wait_for_port "$LUX_BENCH_PORT" "Lux"
-
-redis-server --port "$REDIS_BENCH_PORT" --save "" --appendonly no --daemonize no --loglevel warning >/dev/null 2>&1 &
-REDIS_PID=$!
-wait_for_port "$REDIS_BENCH_PORT" "Redis"
+kill_port "$BENCH_PORT"
 
 run_bench() {
     local port=$1
@@ -99,15 +91,52 @@ run_bench() {
     echo "${rps:-0}"
 }
 
-echo -e "${BOLD}| Pipeline |         Lux |     Redis 7 | Lux/Redis |${NC}"
+declare -a LUX_RESULTS
+declare -a REDIS_RESULTS
+PIPELINES=(1 16 64 128 256 512)
+
+echo -e "${BOLD}Benchmarking Lux...${NC}"
+TMPDIR_LUX=$(mktemp -d)
+LUX_PORT=$BENCH_PORT LUX_SAVE_INTERVAL=0 LUX_DATA_DIR="$TMPDIR_LUX" "$LUX_BIN" >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_port "$BENCH_PORT" "Lux"
+
+for i in "${!PIPELINES[@]}"; do
+    P=${PIPELINES[$i]}
+    LUX_RESULTS[$i]=$(run_bench "$BENCH_PORT" "$P")
+    echo "  pipeline $P: ${LUX_RESULTS[$i]}"
+done
+
+kill "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null || true
+rm -rf "$TMPDIR_LUX"
+TMPDIR_LUX=""
+sleep 1
+
+echo -e "${BOLD}Benchmarking Redis...${NC}"
+kill_port "$BENCH_PORT"
+redis-server --port "$BENCH_PORT" --save "" --appendonly no --daemonize no --loglevel warning >/dev/null 2>&1 &
+SERVER_PID=$!
+wait_for_port "$BENCH_PORT" "Redis"
+
+for i in "${!PIPELINES[@]}"; do
+    P=${PIPELINES[$i]}
+    REDIS_RESULTS[$i]=$(run_bench "$BENCH_PORT" "$P")
+    echo "  pipeline $P: ${REDIS_RESULTS[$i]}"
+done
+
+kill "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null || true
+SERVER_PID=""
+
+echo ""
+echo -e "${BOLD}| Pipeline |         Lux |   Redis ${REDIS_VER} | Lux/Redis |${NC}"
 echo "|----------|------------:|------------:|----------:|"
 
-for P in 1 16 64 128 256; do
-    lux_rps=$(run_bench "$LUX_BENCH_PORT" "$P")
-    redis_rps=$(run_bench "$REDIS_BENCH_PORT" "$P")
-
+for i in "${!PIPELINES[@]}"; do
+    P=${PIPELINES[$i]}
     python3 -c "
-lux=${lux_rps:-0}; red=${redis_rps:-0}
+lux=${LUX_RESULTS[$i]:-0}; red=${REDIS_RESULTS[$i]:-0}
 if red > 0:
     ratio = f'{lux/red:.2f}x'
 else:

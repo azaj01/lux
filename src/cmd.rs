@@ -3055,8 +3055,8 @@ pub type ShardData = hashbrown::HashMap<String, Entry, crate::store::FxBuildHash
 
 pub fn execute_on_shard(
     data: &mut ShardData,
-    store: &Store,
-    broker: &Broker,
+    _store: &Store,
+    _broker: &Broker,
     args: &[&[u8]],
     out: &mut BytesMut,
     now: Instant,
@@ -3069,11 +3069,75 @@ pub fn execute_on_shard(
     let key = args[1];
 
     if cmd_eq(cmd, b"SET") && args.len() >= 3 {
-        if args.len() == 3 {
-            Store::set_on_shard(data, key, args[2], None, now);
-            resp::write_ok(out);
-        } else {
-            execute(store, broker, args, out, now);
+        let mut ttl = None;
+        let mut nx = false;
+        let mut xx = false;
+        let mut parse_err = false;
+        let mut i = 3;
+        while i < args.len() {
+            if cmd_eq(args[i], b"EX") {
+                if i + 1 >= args.len() {
+                    resp::write_error(out, "ERR syntax error");
+                    parse_err = true;
+                    break;
+                }
+                match parse_u64(args[i + 1]) {
+                    Ok(s) => ttl = Some(std::time::Duration::from_secs(s)),
+                    Err(_) => {
+                        resp::write_error(out, "ERR value is not an integer or out of range");
+                        parse_err = true;
+                        break;
+                    }
+                }
+                i += 2;
+            } else if cmd_eq(args[i], b"PX") {
+                if i + 1 >= args.len() {
+                    resp::write_error(out, "ERR syntax error");
+                    parse_err = true;
+                    break;
+                }
+                match parse_u64(args[i + 1]) {
+                    Ok(ms) => ttl = Some(std::time::Duration::from_millis(ms)),
+                    Err(_) => {
+                        resp::write_error(out, "ERR value is not an integer or out of range");
+                        parse_err = true;
+                        break;
+                    }
+                }
+                i += 2;
+            } else if cmd_eq(args[i], b"NX") {
+                nx = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"XX") {
+                xx = true;
+                i += 1;
+            } else {
+                resp::write_error(out, "ERR syntax error");
+                parse_err = true;
+                break;
+            }
+        }
+        if !parse_err {
+            if nx {
+                let exists = Store::get_from_shard(data, key, now).is_some();
+                if !exists {
+                    Store::set_on_shard(data, key, args[2], None, now);
+                    resp::write_ok(out);
+                } else {
+                    resp::write_null(out);
+                }
+            } else if xx {
+                let exists = Store::get_from_shard(data, key, now).is_some();
+                if exists {
+                    Store::set_on_shard(data, key, args[2], ttl, now);
+                    resp::write_ok(out);
+                } else {
+                    resp::write_null(out);
+                }
+            } else {
+                Store::set_on_shard(data, key, args[2], ttl, now);
+                resp::write_ok(out);
+            }
         }
     } else if cmd_eq(cmd, b"GET") {
         Store::get_and_write(data, key, now, out);

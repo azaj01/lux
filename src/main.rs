@@ -1,4 +1,5 @@
 mod cmd;
+mod eviction;
 mod lua;
 mod pubsub;
 mod resp;
@@ -51,9 +52,13 @@ async fn main() -> std::io::Result<()> {
     {
         let store = store.clone();
         tokio::spawn(async move {
+            let start = Instant::now();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                store.expire_sweep(Instant::now());
+                let now = Instant::now();
+                let secs = now.duration_since(start).as_secs() as u32;
+                store::LRU_CLOCK.store(secs & 0x00FF_FFFF, std::sync::atomic::Ordering::Relaxed);
+                store.expire_sweep(now);
             }
         });
     }

@@ -91,6 +91,13 @@ pub fn execute(
 
     let cmd = args[0];
 
+    if crate::eviction::is_write_command(cmd) {
+        if let Err(e) = crate::eviction::evict_if_needed(store) {
+            resp::write_error(out, e);
+            return CmdResult::Written;
+        }
+    }
+
     if cmd_eq(cmd, b"AUTH") {
         if args.len() < 2 {
             resp::write_error(out, "ERR wrong number of arguments for 'auth' command");
@@ -1472,6 +1479,7 @@ pub fn execute(
             Entry {
                 value: StoreValue::Str(Bytes::from(new_str.clone())),
                 expires_at,
+                lru_clock: crate::store::LRU_CLOCK.load(Ordering::Relaxed),
             },
         );
         resp::write_bulk(out, &new_str);
@@ -3365,6 +3373,7 @@ fn shard_incr(data: &mut ShardData, key: &[u8], delta: i64, now: Instant, out: &
                 Entry {
                     value: StoreValue::Str(Bytes::from(new_val.to_string())),
                     expires_at,
+                    lru_clock: crate::store::LRU_CLOCK.load(Ordering::Relaxed),
                 },
             );
             resp::write_integer(out, new_val);
@@ -3385,11 +3394,13 @@ fn shard_list_push(
     let entry = data.entry(ks).or_insert_with(|| Entry {
         value: StoreValue::List(VecDeque::new()),
         expires_at: None,
+        lru_clock: crate::store::LRU_CLOCK.load(Ordering::Relaxed),
     });
     if entry.is_expired_at(now) {
         entry.value = StoreValue::List(VecDeque::new());
         entry.expires_at = None;
     }
+    entry.lru_clock = crate::store::LRU_CLOCK.load(Ordering::Relaxed);
     match &mut entry.value {
         StoreValue::List(list) => {
             for v in values {
@@ -3437,11 +3448,13 @@ fn shard_sadd(
     let entry = data.entry(ks).or_insert_with(|| Entry {
         value: StoreValue::Set(std::collections::HashSet::new()),
         expires_at: None,
+        lru_clock: crate::store::LRU_CLOCK.load(Ordering::Relaxed),
     });
     if entry.is_expired_at(now) {
         entry.value = StoreValue::Set(std::collections::HashSet::new());
         entry.expires_at = None;
     }
+    entry.lru_clock = crate::store::LRU_CLOCK.load(Ordering::Relaxed);
     match &mut entry.value {
         StoreValue::Set(set) => {
             let mut added = 0i64;
@@ -3474,11 +3487,13 @@ fn shard_hset(
     let entry = data.entry(ks).or_insert_with(|| Entry {
         value: StoreValue::Hash(hashbrown::HashMap::new()),
         expires_at: None,
+        lru_clock: crate::store::LRU_CLOCK.load(Ordering::Relaxed),
     });
     if entry.is_expired_at(now) {
         entry.value = StoreValue::Hash(hashbrown::HashMap::new());
         entry.expires_at = None;
     }
+    entry.lru_clock = crate::store::LRU_CLOCK.load(Ordering::Relaxed);
     match &mut entry.value {
         StoreValue::Hash(map) => {
             let mut added = 0i64;
@@ -3649,12 +3664,14 @@ fn shard_zadd(data: &mut ShardData, key: &[u8], rest: &[&[u8]], now: Instant, ou
     let entry = data.entry(ks).or_insert_with(|| Entry {
         value: StoreValue::SortedSet(std::collections::BTreeMap::new(), hashbrown::HashMap::new()),
         expires_at: None,
+        lru_clock: crate::store::LRU_CLOCK.load(Ordering::Relaxed),
     });
     if entry.is_expired_at(now) {
         entry.value =
             StoreValue::SortedSet(std::collections::BTreeMap::new(), hashbrown::HashMap::new());
         entry.expires_at = None;
     }
+    entry.lru_clock = crate::store::LRU_CLOCK.load(Ordering::Relaxed);
     match &mut entry.value {
         StoreValue::SortedSet(tree, scores) => {
             let mut added = 0i64;
@@ -4188,6 +4205,14 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
     } else {
         ""
     };
+    let eviction_cfg = crate::eviction::eviction_config();
+    let policy_str = match eviction_cfg.policy {
+        crate::eviction::EvictionPolicy::NoEviction => "noeviction",
+        crate::eviction::EvictionPolicy::AllKeysLru => "allkeys-lru",
+        crate::eviction::EvictionPolicy::VolatileLru => "volatile-lru",
+        crate::eviction::EvictionPolicy::AllKeysRandom => "allkeys-random",
+        crate::eviction::EvictionPolicy::VolatileRandom => "volatile-random",
+    };
     format!(
         "# Server\r\n\
          redis_version:7.2.0\r\n\
@@ -4204,6 +4229,8 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
          \r\n\
          # Memory\r\n\
          used_memory_bytes:{}\r\n\
+         maxmemory:{}\r\n\
+         maxmemory_policy:{}\r\n\
          \r\n\
          # Keyspace\r\n\
          keys:{}\r\n",
@@ -4212,7 +4239,9 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
         uptime,
         CONNECTED_CLIENTS.load(Ordering::Relaxed),
         TOTAL_COMMANDS.load(Ordering::Relaxed),
-        store.approximate_memory(),
+        crate::store::USED_MEMORY.load(Ordering::Relaxed),
+        eviction_cfg.max_memory,
+        policy_str,
         store.dbsize(now)
     )
 }

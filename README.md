@@ -133,7 +133,27 @@ redis-cli VSEARCH 3 0.1 0.2 0.3 K 5 FILTER title "hello world" META
 redis-cli VCARD
 ```
 
-2ms search latency over 1,000 vectors at 1536 dimensions (OpenAI embedding size). Built for AI agent memory, RAG, and semantic search.
+Sub-millisecond search at 10,000 vectors with HNSW indexing. Built for AI agent memory, RAG, and semantic search.
+
+### SDK
+
+```bash
+npm install @luxdb/sdk
+```
+
+```typescript
+import { Lux } from "@luxdb/sdk"
+
+const db = new Lux("redis://localhost:6379")
+
+await db.set("hello", "world")
+
+await db.vset("doc:1", embedding, { metadata: { title: "my doc" } })
+
+const results = await db.vsearch(queryEmbedding, { k: 5, meta: true })
+```
+
+Extends ioredis with typed methods for vector operations. All standard Redis commands work as usual.
 
 ### Environment Variables
 
@@ -149,18 +169,19 @@ redis-cli VCARD
 | `LUX_MAXMEMORY_SAMPLES` | `5` | Keys sampled per eviction round |
 | `LUX_RESTRICTED` | (none) | Set to `1` to disable KEYS, FLUSHALL, FLUSHDB |
 
-### Node.js (ioredis)
+### Node.js
 
 ```bash
-npm install ioredis
+npm install @luxdb/sdk   # or: npm install ioredis
 ```
 
 ```typescript
-import Redis from "ioredis"
+import { Lux } from "@luxdb/sdk"
 
-const redis = new Redis("redis://localhost:6379")
-await redis.set("hello", "world")
-console.log(await redis.get("hello")) // "world"
+const db = new Lux("redis://localhost:6379")
+await db.set("hello", "world")
+await db.vset("doc:1", [0.1, 0.2, 0.3], { metadata: { title: "hello" } })
+const results = await db.vsearch([0.1, 0.2, 0.3], { k: 5, meta: true })
 ```
 
 ### Python (redis-py)

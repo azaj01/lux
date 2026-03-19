@@ -126,7 +126,14 @@ pub fn geohash_to_base32(hash: u64) -> String {
     String::from_utf8_lossy(&buf).to_string()
 }
 
-pub fn in_box(center_lon: f64, center_lat: f64, width_m: f64, height_m: f64, lon: f64, lat: f64) -> bool {
+pub fn in_box(
+    center_lon: f64,
+    center_lat: f64,
+    width_m: f64,
+    height_m: f64,
+    lon: f64,
+    lat: f64,
+) -> bool {
     let lat_dist = EARTH_RADIUS_M * (lat.to_radians() - center_lat.to_radians()).abs();
     if lat_dist > height_m / 2.0 {
         return false;
@@ -168,12 +175,16 @@ mod tests {
             assert!(
                 (lon - lon2).abs() < 0.001,
                 "lon mismatch: {} vs {} (hash={})",
-                lon, lon2, hash
+                lon,
+                lon2,
+                hash
             );
             assert!(
                 (lat - lat2).abs() < 0.001,
                 "lat mismatch: {} vs {} (hash={})",
-                lat, lat2, hash
+                lat,
+                lat2,
+                hash
             );
         }
     }
@@ -183,7 +194,8 @@ mod tests {
         let d = haversine(13.361389, 38.115556, 15.087269, 37.502669);
         assert!(
             (d - 166274.0).abs() < 200.0,
-            "Palermo-Catania distance wrong: {}", d
+            "Palermo-Catania distance wrong: {}",
+            d
         );
     }
 
@@ -210,16 +222,14 @@ mod tests {
         let hash = geohash_encode(13.361389, 38.115556);
         let b32 = geohash_to_base32(hash);
         assert_eq!(b32.len(), 11);
-        assert!(
-            b32.starts_with("sqc8b49rny"),
-            "Palermo geohash: {}", b32
-        );
+        assert!(b32.starts_with("sqc8b49rny"), "Palermo geohash: {}", b32);
 
         let hash2 = geohash_encode(15.087269, 37.502669);
         let b32_2 = geohash_to_base32(hash2);
         assert!(
             b32_2.starts_with("sqdtr74hyu"),
-            "Catania geohash: {}", b32_2
+            "Catania geohash: {}",
+            b32_2
         );
     }
 

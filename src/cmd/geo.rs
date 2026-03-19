@@ -117,7 +117,10 @@ pub fn cmd_geodist(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         match DistUnit::parse(arg_str(args[4])) {
             Some(u) => u,
             None => {
-                resp::write_error(out, "ERR unsupported unit provided. please use M, KM, FT, MI");
+                resp::write_error(
+                    out,
+                    "ERR unsupported unit provided. please use M, KM, FT, MI",
+                );
                 return CmdResult::Written;
             }
         }
@@ -126,13 +129,25 @@ pub fn cmd_geodist(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
     };
     let s1 = match store.zscore(args[1], args[2], now) {
         Ok(Some(s)) => s,
-        Ok(None) => { resp::write_null(out); return CmdResult::Written; }
-        Err(e) => { resp::write_error(out, &e); return CmdResult::Written; }
+        Ok(None) => {
+            resp::write_null(out);
+            return CmdResult::Written;
+        }
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
     };
     let s2 = match store.zscore(args[1], args[3], now) {
         Ok(Some(s)) => s,
-        Ok(None) => { resp::write_null(out); return CmdResult::Written; }
-        Err(e) => { resp::write_error(out, &e); return CmdResult::Written; }
+        Ok(None) => {
+            resp::write_null(out);
+            return CmdResult::Written;
+        }
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
     };
     let (lon1, lat1) = geo::geohash_decode(s1 as u64);
     let (lon2, lat2) = geo::geohash_decode(s2 as u64);
@@ -156,7 +171,10 @@ pub fn cmd_geopos(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instan
                 resp::write_bulk(out, &format_geo_coord(lat));
             }
             Ok(None) => resp::write_null_array(out),
-            Err(e) => { resp::write_error(out, &e); return CmdResult::Written; }
+            Err(e) => {
+                resp::write_error(out, &e);
+                return CmdResult::Written;
+            }
         }
     }
     CmdResult::Written
@@ -172,7 +190,10 @@ pub fn cmd_geohash(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
         match store.zscore(args[1], member, now) {
             Ok(Some(s)) => resp::write_bulk(out, &geo::geohash_to_base32(s as u64)),
             Ok(None) => resp::write_null(out),
-            Err(e) => { resp::write_error(out, &e); return CmdResult::Written; }
+            Err(e) => {
+                resp::write_error(out, &e);
+                return CmdResult::Written;
+            }
         }
     }
     CmdResult::Written
@@ -230,7 +251,9 @@ fn execute_geosearch(
             ];
             let lo = *hashes.iter().min().unwrap();
             let hi = *hashes.iter().max().unwrap();
-            store.zrangebyscore(key, lo as f64, hi as f64, false, false, false, None, None, true, now)?
+            store.zrangebyscore(
+                key, lo as f64, hi as f64, false, false, false, None, None, true, now,
+            )?
         } else {
             store.zrange(key, 0, -1, false, true, now)?
         }
@@ -252,7 +275,13 @@ fn execute_geosearch(
         };
 
         if in_area {
-            results.push(GeoResult { member: member.clone(), dist, hash, lon, lat });
+            results.push(GeoResult {
+                member: member.clone(),
+                dist,
+                hash,
+                lon,
+                lat,
+            });
         }
     }
 
@@ -293,7 +322,11 @@ fn write_results(
         let members: Vec<(&[u8], f64)> = results
             .iter()
             .map(|r| {
-                let score = if params.store_dist { params.unit.from_meters(r.dist) } else { r.hash as f64 };
+                let score = if params.store_dist {
+                    params.unit.from_meters(r.dist)
+                } else {
+                    r.hash as f64
+                };
                 (r.member.as_bytes(), score)
             })
             .collect();
@@ -351,16 +384,26 @@ pub fn cmd_geosearch(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Ins
     CmdResult::Written
 }
 
-pub fn cmd_geosearchstore(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+pub fn cmd_geosearchstore(
+    args: &[&[u8]],
+    store: &Store,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
     if args.len() < 5 {
-        resp::write_error(out, "ERR wrong number of arguments for 'geosearchstore' command");
+        resp::write_error(
+            out,
+            "ERR wrong number of arguments for 'geosearchstore' command",
+        );
         return CmdResult::Written;
     }
     let dest = args[1];
     let src = args[2];
     let mut store_dist = false;
     for arg in &args[3..] {
-        if cmd_eq(arg, b"STOREDIST") { store_dist = true; }
+        if cmd_eq(arg, b"STOREDIST") {
+            store_dist = true;
+        }
     }
     match parse_geosearch_params(args, 3, store, src, now, true) {
         Ok(mut params) => {
@@ -385,28 +428,51 @@ pub fn cmd_georadius(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Ins
     let key = args[1];
     let lon: f64 = match arg_str(args[2]).parse() {
         Ok(v) => v,
-        Err(_) => { resp::write_error(out, "ERR value is not a valid float"); return CmdResult::Written; }
+        Err(_) => {
+            resp::write_error(out, "ERR value is not a valid float");
+            return CmdResult::Written;
+        }
     };
     let lat: f64 = match arg_str(args[3]).parse() {
         Ok(v) => v,
-        Err(_) => { resp::write_error(out, "ERR value is not a valid float"); return CmdResult::Written; }
+        Err(_) => {
+            resp::write_error(out, "ERR value is not a valid float");
+            return CmdResult::Written;
+        }
     };
     let radius: f64 = match arg_str(args[4]).parse() {
         Ok(v) => v,
-        Err(_) => { resp::write_error(out, "ERR value is not a valid float"); return CmdResult::Written; }
+        Err(_) => {
+            resp::write_error(out, "ERR value is not a valid float");
+            return CmdResult::Written;
+        }
     };
     let unit = match DistUnit::parse(arg_str(args[5])) {
         Some(u) => u,
-        None => { resp::write_error(out, "ERR unsupported unit provided. please use M, KM, FT, MI"); return CmdResult::Written; }
+        None => {
+            resp::write_error(
+                out,
+                "ERR unsupported unit provided. please use M, KM, FT, MI",
+            );
+            return CmdResult::Written;
+        }
     };
 
     let mut params = GeoSearchParams {
-        center_lon: lon, center_lat: lat,
+        center_lon: lon,
+        center_lat: lat,
         radius_m: Some(unit.to_meters(radius)),
-        box_width_m: None, box_height_m: None,
-        sort: None, count: None, count_any: false,
-        with_coord: false, with_dist: false, with_hash: false,
-        unit, store_key: None, store_dist: false,
+        box_width_m: None,
+        box_height_m: None,
+        sort: None,
+        count: None,
+        count_any: false,
+        with_coord: false,
+        with_dist: false,
+        with_hash: false,
+        unit,
+        store_key: None,
+        store_dist: false,
     };
 
     if let Err(true) = parse_legacy_options(args, 6, &mut params, out) {
@@ -420,28 +486,53 @@ pub fn cmd_georadius(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Ins
     CmdResult::Written
 }
 
-pub fn cmd_georadiusbymember(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+pub fn cmd_georadiusbymember(
+    args: &[&[u8]],
+    store: &Store,
+    out: &mut BytesMut,
+    now: Instant,
+) -> CmdResult {
     if args.len() < 5 {
-        resp::write_error(out, "ERR wrong number of arguments for 'georadiusbymember' command");
+        resp::write_error(
+            out,
+            "ERR wrong number of arguments for 'georadiusbymember' command",
+        );
         return CmdResult::Written;
     }
     let key = args[1];
     let radius: f64 = match arg_str(args[3]).parse() {
         Ok(v) => v,
-        Err(_) => { resp::write_error(out, "ERR value is not a valid float"); return CmdResult::Written; }
+        Err(_) => {
+            resp::write_error(out, "ERR value is not a valid float");
+            return CmdResult::Written;
+        }
     };
     let unit = match DistUnit::parse(arg_str(args[4])) {
         Some(u) => u,
-        None => { resp::write_error(out, "ERR unsupported unit provided. please use M, KM, FT, MI"); return CmdResult::Written; }
+        None => {
+            resp::write_error(
+                out,
+                "ERR unsupported unit provided. please use M, KM, FT, MI",
+            );
+            return CmdResult::Written;
+        }
     };
 
     let mut params = GeoSearchParams {
-        center_lon: 0.0, center_lat: 0.0,
+        center_lon: 0.0,
+        center_lat: 0.0,
         radius_m: Some(unit.to_meters(radius)),
-        box_width_m: None, box_height_m: None,
-        sort: None, count: None, count_any: false,
-        with_coord: false, with_dist: false, with_hash: false,
-        unit, store_key: None, store_dist: false,
+        box_width_m: None,
+        box_height_m: None,
+        sort: None,
+        count: None,
+        count_any: false,
+        with_coord: false,
+        with_dist: false,
+        with_hash: false,
+        unit,
+        store_key: None,
+        store_dist: false,
     };
 
     if let Err(true) = parse_legacy_options(args, 5, &mut params, out) {
@@ -458,8 +549,14 @@ pub fn cmd_georadiusbymember(args: &[&[u8]], store: &Store, out: &mut BytesMut, 
             }
             return CmdResult::Written;
         }
-        Ok(MemberLookup::MemberMissing) => { resp::write_error(out, "ERR could not decode requested zset member"); return CmdResult::Written; }
-        Err(e) => { resp::write_error(out, &e); return CmdResult::Written; }
+        Ok(MemberLookup::MemberMissing) => {
+            resp::write_error(out, "ERR could not decode requested zset member");
+            return CmdResult::Written;
+        }
+        Err(e) => {
+            resp::write_error(out, &e);
+            return CmdResult::Written;
+        }
     };
     params.center_lon = lon;
     params.center_lat = lat;
@@ -496,7 +593,10 @@ fn parse_legacy_options(
             }
             match arg_str(args[i + 1]).parse::<usize>() {
                 Ok(n) => params.count = Some(n),
-                Err(_) => { resp::write_error(out, "ERR syntax error"); return Err(true); }
+                Err(_) => {
+                    resp::write_error(out, "ERR syntax error");
+                    return Err(true);
+                }
             }
             i += 1;
             if i + 1 < args.len() && cmd_eq(args[i + 1], b"ANY") {
@@ -566,69 +666,139 @@ fn parse_geosearch_params(
     let mut i = start;
     while i < args.len() {
         if cmd_eq(args[i], b"FROMMEMBER") && i + 1 < args.len() {
-            if has_from { return Err(GeoParseError::Err("ERR syntax error".into())); }
+            if has_from {
+                return Err(GeoParseError::Err("ERR syntax error".into()));
+            }
             has_from = true;
             match lookup_member_coords(store, key, args[i + 1], now) {
-                Ok(MemberLookup::Found(lon, lat)) => { center_lon = Some(lon); center_lat = Some(lat); }
+                Ok(MemberLookup::Found(lon, lat)) => {
+                    center_lon = Some(lon);
+                    center_lat = Some(lat);
+                }
                 Ok(MemberLookup::KeyMissing) => return Err(GeoParseError::KeyMissing),
-                Ok(MemberLookup::MemberMissing) => return Err(GeoParseError::Err("ERR could not decode requested zset member".into())),
+                Ok(MemberLookup::MemberMissing) => {
+                    return Err(GeoParseError::Err(
+                        "ERR could not decode requested zset member".into(),
+                    ))
+                }
                 Err(e) => return Err(GeoParseError::Err(e)),
             }
             i += 2;
         } else if cmd_eq(args[i], b"FROMLONLAT") && i + 2 < args.len() {
-            if has_from { return Err(GeoParseError::Err("ERR syntax error".into())); }
+            if has_from {
+                return Err(GeoParseError::Err("ERR syntax error".into()));
+            }
             has_from = true;
-            let lon: f64 = arg_str(args[i + 1]).parse().map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
-            let lat: f64 = arg_str(args[i + 2]).parse().map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
+            let lon: f64 = arg_str(args[i + 1])
+                .parse()
+                .map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
+            let lat: f64 = arg_str(args[i + 2])
+                .parse()
+                .map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
             geo::validate_coords(lon, lat).map_err(GeoParseError::Err)?;
             center_lon = Some(lon);
             center_lat = Some(lat);
             i += 3;
         } else if cmd_eq(args[i], b"BYRADIUS") && i + 2 < args.len() {
-            if has_by { return Err(GeoParseError::Err("ERR syntax error".into())); }
+            if has_by {
+                return Err(GeoParseError::Err("ERR syntax error".into()));
+            }
             has_by = true;
-            let r: f64 = arg_str(args[i + 1]).parse().map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
-            let u = DistUnit::parse(arg_str(args[i + 2])).ok_or_else(|| GeoParseError::Err("ERR unsupported unit provided. please use M, KM, FT, MI".into()))?;
+            let r: f64 = arg_str(args[i + 1])
+                .parse()
+                .map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
+            let u = DistUnit::parse(arg_str(args[i + 2])).ok_or_else(|| {
+                GeoParseError::Err("ERR unsupported unit provided. please use M, KM, FT, MI".into())
+            })?;
             unit = u;
             radius_m = Some(u.to_meters(r));
             i += 3;
         } else if cmd_eq(args[i], b"BYBOX") && i + 3 < args.len() {
-            if has_by { return Err(GeoParseError::Err("ERR syntax error".into())); }
+            if has_by {
+                return Err(GeoParseError::Err("ERR syntax error".into()));
+            }
             has_by = true;
-            let w: f64 = arg_str(args[i + 1]).parse().map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
-            let h: f64 = arg_str(args[i + 2]).parse().map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
-            let u = DistUnit::parse(arg_str(args[i + 3])).ok_or_else(|| GeoParseError::Err("ERR unsupported unit provided. please use M, KM, FT, MI".into()))?;
+            let w: f64 = arg_str(args[i + 1])
+                .parse()
+                .map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
+            let h: f64 = arg_str(args[i + 2])
+                .parse()
+                .map_err(|_| GeoParseError::Err("ERR value is not a valid float".into()))?;
+            let u = DistUnit::parse(arg_str(args[i + 3])).ok_or_else(|| {
+                GeoParseError::Err("ERR unsupported unit provided. please use M, KM, FT, MI".into())
+            })?;
             unit = u;
             box_width_m = Some(u.to_meters(w));
             box_height_m = Some(u.to_meters(h));
             i += 4;
-        } else if cmd_eq(args[i], b"ASC") { sort = Some(true); i += 1;
-        } else if cmd_eq(args[i], b"DESC") { sort = Some(false); i += 1;
+        } else if cmd_eq(args[i], b"ASC") {
+            sort = Some(true);
+            i += 1;
+        } else if cmd_eq(args[i], b"DESC") {
+            sort = Some(false);
+            i += 1;
         } else if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
             count = arg_str(args[i + 1]).parse().ok();
-            if count.is_none() { return Err(GeoParseError::Err("ERR syntax error".into())); }
+            if count.is_none() {
+                return Err(GeoParseError::Err("ERR syntax error".into()));
+            }
             i += 2;
-            if i < args.len() && cmd_eq(args[i], b"ANY") { count_any = true; i += 1; }
-        } else if cmd_eq(args[i], b"WITHCOORD") { with_coord = true; i += 1;
-        } else if cmd_eq(args[i], b"WITHDIST") { with_dist = true; i += 1;
-        } else if cmd_eq(args[i], b"WITHHASH") { with_hash = true; i += 1;
+            if i < args.len() && cmd_eq(args[i], b"ANY") {
+                count_any = true;
+                i += 1;
+            }
+        } else if cmd_eq(args[i], b"WITHCOORD") {
+            with_coord = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"WITHDIST") {
+            with_dist = true;
+            i += 1;
+        } else if cmd_eq(args[i], b"WITHHASH") {
+            with_hash = true;
+            i += 1;
         } else if cmd_eq(args[i], b"STOREDIST") {
-            if !is_store { return Err(GeoParseError::Err("ERR syntax error".into())); }
+            if !is_store {
+                return Err(GeoParseError::Err("ERR syntax error".into()));
+            }
             i += 1;
         } else if cmd_eq(args[i], b"STORE") {
-            if !is_store { return Err(GeoParseError::Err("ERR syntax error".into())); }
+            if !is_store {
+                return Err(GeoParseError::Err("ERR syntax error".into()));
+            }
             return Err(GeoParseError::Err("ERR syntax error".into()));
-        } else { i += 1; }
+        } else {
+            i += 1;
+        }
     }
 
-    if !has_from { return Err(GeoParseError::Err("ERR exactly one of FROMMEMBER or FROMLONLAT must be provided".into())); }
-    if !has_by { return Err(GeoParseError::Err("ERR exactly one of BYRADIUS and BYBOX must be provided".into())); }
-    if count_any && count.is_none() { return Err(GeoParseError::Err("ERR syntax error".into())); }
+    if !has_from {
+        return Err(GeoParseError::Err(
+            "ERR exactly one of FROMMEMBER or FROMLONLAT must be provided".into(),
+        ));
+    }
+    if !has_by {
+        return Err(GeoParseError::Err(
+            "ERR exactly one of BYRADIUS and BYBOX must be provided".into(),
+        ));
+    }
+    if count_any && count.is_none() {
+        return Err(GeoParseError::Err("ERR syntax error".into()));
+    }
 
     Ok(GeoSearchParams {
-        center_lon: center_lon.unwrap(), center_lat: center_lat.unwrap(),
-        radius_m, box_width_m, box_height_m, sort, count, count_any,
-        with_coord, with_dist, with_hash, unit,
-        store_key: None, store_dist: false,
+        center_lon: center_lon.unwrap(),
+        center_lat: center_lat.unwrap(),
+        radius_m,
+        box_width_m,
+        box_height_m,
+        sort,
+        count,
+        count_any,
+        with_coord,
+        with_dist,
+        with_hash,
+        unit,
+        store_key: None,
+        store_dist: false,
     })
 }

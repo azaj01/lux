@@ -61,8 +61,7 @@ impl Drop for LuxServer {
 
 fn start_lux(port: u16) -> LuxServer {
     let bin = find_lux_binary().expect("no lux binary found - run `cargo build` first");
-    let tmpdir =
-        std::env::temp_dir().join(format!("lux_geo_test_{}_{}", std::process::id(), port));
+    let tmpdir = std::env::temp_dir().join(format!("lux_geo_test_{}_{}", std::process::id(), port));
     std::fs::create_dir_all(&tmpdir).unwrap();
     let child = std::process::Command::new(&bin)
         .env("LUX_PORT", port.to_string())
@@ -143,21 +142,13 @@ fn test_geoadd_nx_xx_ch() {
         &mut conn,
         &["GEOADD", "key", "XX", "15.0", "37.0", "Missing"],
     );
-    assert!(
-        resp.contains(":0"),
-        "XX should not add missing: {resp}"
-    );
+    assert!(resp.contains(":0"), "XX should not add missing: {resp}");
 
     let resp = send_and_read(
         &mut conn,
-        &[
-            "GEOADD", "key", "XX", "CH", "14.0", "37.5", "Palermo",
-        ],
+        &["GEOADD", "key", "XX", "CH", "14.0", "37.5", "Palermo"],
     );
-    assert!(
-        resp.contains(":1"),
-        "XX CH should count changed: {resp}"
-    );
+    assert!(resp.contains(":1"), "XX CH should count changed: {resp}");
 }
 
 #[test]
@@ -190,10 +181,7 @@ fn test_geodist_basic() {
         &mut conn,
         &["GEODIST", "Sicily", "Palermo", "Catania", "km"],
     );
-    assert!(
-        resp.contains("166."),
-        "distance should be ~166 km: {resp}"
-    );
+    assert!(resp.contains("166."), "distance should be ~166 km: {resp}");
 
     let resp = send_and_read(
         &mut conn,
@@ -201,14 +189,8 @@ fn test_geodist_basic() {
     );
     assert!(resp.contains("103."), "distance in miles: {resp}");
 
-    let resp = send_and_read(
-        &mut conn,
-        &["GEODIST", "Sicily", "Palermo", "Missing"],
-    );
-    assert!(
-        resp.contains("$-1"),
-        "missing member returns null: {resp}"
-    );
+    let resp = send_and_read(&mut conn, &["GEODIST", "Sicily", "Palermo", "Missing"]);
+    assert!(resp.contains("$-1"), "missing member returns null: {resp}");
 }
 
 #[test]
@@ -278,10 +260,7 @@ fn test_geohash_basic() {
     );
 
     let resp = send_and_read(&mut conn, &["GEOHASH", "Sicily", "Missing"]);
-    assert!(
-        resp.contains("$-1"),
-        "missing member returns null: {resp}"
-    );
+    assert!(resp.contains("$-1"), "missing member returns null: {resp}");
 }
 
 #[test]
@@ -339,10 +318,7 @@ fn test_geosearch_byradius() {
             "2",
         ],
     );
-    assert!(
-        resp.contains("Catania"),
-        "should include Catania: {resp}"
-    );
+    assert!(resp.contains("Catania"), "should include Catania: {resp}");
 
     let resp = send_and_read(
         &mut conn,
@@ -480,10 +456,7 @@ fn test_geosearchstore() {
     assert!(resp.contains(":2"), "should store 2 results: {resp}");
 
     let resp = send_and_read(&mut conn, &["ZCARD", "dest"]);
-    assert!(
-        resp.contains(":2"),
-        "dest should have 2 members: {resp}"
-    );
+    assert!(resp.contains(":2"), "dest should have 2 members: {resp}");
 
     let resp = send_and_read(
         &mut conn,
@@ -501,10 +474,7 @@ fn test_geosearchstore() {
             "STOREDIST",
         ],
     );
-    assert!(
-        resp.contains(":2"),
-        "STOREDIST should store 2: {resp}"
-    );
+    assert!(resp.contains(":2"), "STOREDIST should store 2: {resp}");
 
     let resp = send_and_read(&mut conn, &["ZSCORE", "dest2", "Catania"]);
     assert!(
@@ -563,14 +533,7 @@ fn test_georadiusbymember_legacy() {
 
     let resp = send_and_read(
         &mut conn,
-        &[
-            "GEORADIUSBYMEMBER",
-            "Sicily",
-            "Palermo",
-            "200",
-            "km",
-            "ASC",
-        ],
+        &["GEORADIUSBYMEMBER", "Sicily", "Palermo", "200", "km", "ASC"],
     );
     assert!(resp.contains("Palermo"), "should include self: {resp}");
     assert!(resp.contains("Catania"), "should include Catania: {resp}");
@@ -582,19 +545,10 @@ fn test_geoadd_invalid_coords() {
     let _server = start_lux(port);
     let mut conn = connect(port);
 
-    let resp = send_and_read(
-        &mut conn,
-        &["GEOADD", "key", "181", "38", "member"],
-    );
-    assert!(
-        resp.contains("ERR"),
-        "longitude > 180 should error: {resp}"
-    );
+    let resp = send_and_read(&mut conn, &["GEOADD", "key", "181", "38", "member"]);
+    assert!(resp.contains("ERR"), "longitude > 180 should error: {resp}");
 
-    let resp = send_and_read(
-        &mut conn,
-        &["GEOADD", "key", "13", "86", "member"],
-    );
+    let resp = send_and_read(&mut conn, &["GEOADD", "key", "13", "86", "member"]);
     assert!(
         resp.contains("ERR"),
         "latitude > 85.05 should error: {resp}"
@@ -611,10 +565,7 @@ fn test_geo_empty_key() {
     assert!(resp.contains("$-1"), "empty key returns null: {resp}");
 
     let resp = send_and_read(&mut conn, &["GEOPOS", "nokey", "a"]);
-    assert!(
-        resp.contains("*-1"),
-        "empty key returns null array: {resp}"
-    );
+    assert!(resp.contains("*-1"), "empty key returns null array: {resp}");
 
     let resp = send_and_read(
         &mut conn,

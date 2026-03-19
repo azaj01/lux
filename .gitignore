@@ -3,3 +3,6 @@
 *.dat.tmp
 sdk/node_modules/
 sdk/dist/
+
+# nix
+/result

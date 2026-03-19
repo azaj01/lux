@@ -32,8 +32,8 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> String {
     if line.starts_with('+') || line.starts_with('-') || line.starts_with(':') {
         return line;
     }
-    if line.starts_with('$') {
-        let len: i64 = line[1..].parse().unwrap();
+    if let Some(rest) = line.strip_prefix('$') {
+        let len: i64 = rest.parse().unwrap();
         if len < 0 {
             return "$-1".to_string();
         }
@@ -42,8 +42,8 @@ fn read_response(reader: &mut BufReader<TcpStream>) -> String {
         let s = String::from_utf8_lossy(&buf[..len as usize]).to_string();
         return format!("${}", s);
     }
-    if line.starts_with('*') {
-        let count: i64 = line[1..].parse().unwrap();
+    if let Some(rest) = line.strip_prefix('*') {
+        let count: i64 = rest.parse().unwrap();
         if count < 0 {
             return "*-1".to_string();
         }
@@ -77,6 +77,7 @@ fn vset_and_vget_basic() {
     );
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -104,6 +105,7 @@ fn vset_with_metadata() {
     assert!(r.contains("test"), "expected metadata: {}", r);
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -125,6 +127,7 @@ fn vset_with_ttl() {
     assert!(r.contains("-1"), "should be expired: {}", r);
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -149,6 +152,7 @@ fn vcard_counts_vectors() {
     assert_eq!(r, ":2");
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -173,6 +177,7 @@ fn vsearch_returns_nearest() {
     );
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -230,6 +235,7 @@ fn vsearch_with_metadata_filter() {
     assert!(!r.contains("dog1"), "should not find dog1: {}", r);
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -263,6 +269,7 @@ fn vsearch_with_meta_flag() {
     assert!(!r.contains("hello"), "without META, no metadata: {}", r);
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -276,6 +283,7 @@ fn vset_dimension_mismatch() {
     assert!(r.starts_with("-"), "should error on dim mismatch: {}", r);
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -295,6 +303,7 @@ fn vset_overwrites_existing() {
     assert!(r.contains("v"), "should find updated vector");
 
     child.kill().ok();
+    child.wait().ok();
 }
 
 #[test]
@@ -309,4 +318,5 @@ fn vector_type_command() {
     assert_eq!(r, "+vector");
 
     child.kill().ok();
+    child.wait().ok();
 }

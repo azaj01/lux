@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "lux"
-version = "0.7.3"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "hashbrown",

@@ -667,6 +667,9 @@ pub fn execute(
             if cmd_eq(cmd, b"TSCHEMA") {
                 return tables::cmd_tschema(args, store, out, now);
             }
+            if cmd_eq(cmd, b"TALTER") {
+                return tables::cmd_talter(args, store, out, now);
+            }
             if cmd_eq(cmd, b"TLIST") {
                 return tables::cmd_tlist(args, store, out, now);
             }
@@ -1757,6 +1760,7 @@ pub fn is_known_command(cmd: &[u8]) -> bool {
         || cmd_eq(cmd, b"TCOUNT")
         || cmd_eq(cmd, b"TSCHEMA")
         || cmd_eq(cmd, b"TLIST")
+        || cmd_eq(cmd, b"TALTER")
 }
 
 pub fn validate_args(args: &[&[u8]]) -> Result<(), String> {

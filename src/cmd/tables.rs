@@ -187,6 +187,39 @@ pub fn cmd_tschema(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Insta
     CmdResult::Written
 }
 
+pub fn cmd_talter(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
+    if args.len() < 4 {
+        resp::write_error(out, "ERR wrong number of arguments for 'talter' command");
+        return CmdResult::Written;
+    }
+    let table = arg_str(args[1]);
+    let action = arg_str(args[2]).to_uppercase();
+    match action.as_str() {
+        "ADD" => {
+            let field_spec = arg_str(args[3]);
+            match tables::table_add_column(store, table, field_spec, now) {
+                Ok(()) => resp::write_ok(out),
+                Err(e) => resp::write_error(out, &e),
+            }
+        }
+        "DROP" => {
+            let field_name = arg_str(args[3]);
+            match tables::table_drop_column(store, table, field_name, now) {
+                Ok(()) => resp::write_ok(out),
+                Err(e) => resp::write_error(out, &e),
+            }
+        }
+        _ => resp::write_error(
+            out,
+            &format!(
+                "ERR unknown TALTER action '{}', expected ADD or DROP",
+                action
+            ),
+        ),
+    }
+    CmdResult::Written
+}
+
 pub fn cmd_tlist(args: &[&[u8]], store: &Store, out: &mut BytesMut, now: Instant) -> CmdResult {
     if args.len() != 1 {
         resp::write_error(out, "ERR wrong number of arguments for 'tlist' command");

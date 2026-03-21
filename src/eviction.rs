@@ -267,6 +267,7 @@ pub fn is_write_command(cmd: &[u8]) -> bool {
         || eq(cmd, b"TUPDATE")
         || eq(cmd, b"TDEL")
         || eq(cmd, b"TDROP")
+        || eq(cmd, b"TALTER")
 }
 
 #[cfg(test)]

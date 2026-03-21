@@ -8,6 +8,8 @@ pub enum FieldType {
     Str,
     Int,
     Float,
+    Bool,
+    Timestamp,
     Ref(String),
 }
 
@@ -104,6 +106,8 @@ fn parse_field_def(spec: &str) -> Result<FieldDef, String> {
             "str" => FieldType::Str,
             "int" => FieldType::Int,
             "float" => FieldType::Float,
+            "bool" => FieldType::Bool,
+            "timestamp" => FieldType::Timestamp,
             _ => return Err(format!("ERR unknown field type '{}'", type_str)),
         }
     };
@@ -127,6 +131,8 @@ fn encode_field_def(def: &FieldDef) -> String {
         FieldType::Str => "str".to_string(),
         FieldType::Int => "int".to_string(),
         FieldType::Float => "float".to_string(),
+        FieldType::Bool => "bool".to_string(),
+        FieldType::Timestamp => "timestamp".to_string(),
         FieldType::Ref(t) => format!("ref:{}", t),
     };
     if def.unique {
@@ -144,6 +150,8 @@ fn decode_field_def(name: &str, encoded: &str) -> FieldDef {
         "str" => (FieldType::Str, rest == "unique"),
         "int" => (FieldType::Int, rest == "unique"),
         "float" => (FieldType::Float, rest == "unique"),
+        "bool" => (FieldType::Bool, rest == "unique"),
+        "timestamp" => (FieldType::Timestamp, rest == "unique"),
         "ref" => (FieldType::Ref(rest.to_string()), false),
         _ => (FieldType::Str, false),
     };
@@ -185,6 +193,25 @@ fn validate_value(field: &FieldDef, value: &str) -> Result<(), String> {
             })?;
             Ok(())
         }
+        FieldType::Bool => match value {
+            "true" | "false" | "1" | "0" => Ok(()),
+            _ => Err(format!(
+                "ERR field '{}' expects bool (true/false/1/0), got '{}'",
+                field.name, value
+            )),
+        },
+        FieldType::Timestamp => {
+            if value == "*" {
+                return Ok(());
+            }
+            value.parse::<i64>().map_err(|_| {
+                format!(
+                    "ERR field '{}' expects timestamp (epoch ms or *), got '{}'",
+                    field.name, value
+                )
+            })?;
+            Ok(())
+        }
     }
 }
 
@@ -202,7 +229,11 @@ fn next_id(store: &Store, table: &str, now: Instant) -> i64 {
 fn add_to_index(store: &Store, table: &str, field: &FieldDef, value: &str, id: i64, now: Instant) {
     let id_str = id.to_string();
     match &field.field_type {
-        FieldType::Int | FieldType::Float | FieldType::Ref(_) => {
+        FieldType::Int
+        | FieldType::Float
+        | FieldType::Bool
+        | FieldType::Timestamp
+        | FieldType::Ref(_) => {
             let score: f64 = value.parse().unwrap_or(0.0);
             let zkey = idx_sorted_key(table, &field.name);
             let _ = store.zadd(
@@ -233,7 +264,11 @@ fn remove_from_index(
 ) {
     let id_str = id.to_string();
     match &field.field_type {
-        FieldType::Int | FieldType::Float | FieldType::Ref(_) => {
+        FieldType::Int
+        | FieldType::Float
+        | FieldType::Bool
+        | FieldType::Timestamp
+        | FieldType::Ref(_) => {
             let zkey = idx_sorted_key(table, &field.name);
             let _ = store.zrem(zkey.as_bytes(), &[id_str.as_bytes()], now);
         }
@@ -345,7 +380,16 @@ pub fn table_insert(
     let mut pairs_owned: Vec<(String, String)> = Vec::new();
     for field in &schema {
         if let Some(value) = provided.get(field.name.as_str()) {
-            pairs_owned.push((field.name.clone(), value.to_string()));
+            let resolved = if field.field_type == FieldType::Timestamp && *value == "*" {
+                let epoch_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                epoch_ms.to_string()
+            } else {
+                value.to_string()
+            };
+            pairs_owned.push((field.name.clone(), resolved));
         }
     }
 
@@ -596,7 +640,11 @@ pub fn table_drop(store: &Store, table: &str, now: Instant) -> Result<(), String
 
     for field in &schema {
         match &field.field_type {
-            FieldType::Int | FieldType::Float | FieldType::Ref(_) => {
+            FieldType::Int
+            | FieldType::Float
+            | FieldType::Bool
+            | FieldType::Timestamp
+            | FieldType::Ref(_) => {
                 let zkey = idx_sorted_key(table, &field.name);
                 store.del(&[zkey.as_bytes()]);
             }
@@ -632,6 +680,8 @@ pub fn table_schema(store: &Store, table: &str, now: Instant) -> Result<Vec<Stri
             FieldType::Str => "str".to_string(),
             FieldType::Int => "int".to_string(),
             FieldType::Float => "float".to_string(),
+            FieldType::Bool => "bool".to_string(),
+            FieldType::Timestamp => "timestamp".to_string(),
             FieldType::Ref(t) => format!("ref({})", t),
         };
         let mut desc = format!("{}:{}", field.name, type_str);
@@ -641,6 +691,62 @@ pub fn table_schema(store: &Store, table: &str, now: Instant) -> Result<Vec<Stri
         result.push(desc);
     }
     Ok(result)
+}
+
+pub fn table_add_column(
+    store: &Store,
+    table: &str,
+    field_spec: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, table, now)?;
+    let new_field = parse_field_def(field_spec)?;
+
+    if schema.iter().any(|f| f.name == new_field.name) {
+        return Err(format!("ERR field '{}' already exists", new_field.name));
+    }
+
+    let key = schema_key(table);
+    let encoded = encode_field_def(&new_field);
+    store.hset(
+        key.as_bytes(),
+        &[(
+            new_field.name.as_bytes() as &[u8],
+            encoded.as_bytes() as &[u8],
+        )],
+        now,
+    )?;
+    Ok(())
+}
+
+pub fn table_drop_column(
+    store: &Store,
+    table: &str,
+    field_name: &str,
+    now: Instant,
+) -> Result<(), String> {
+    let schema = load_schema(store, table, now)?;
+
+    if !schema.iter().any(|f| f.name == field_name) {
+        return Err(format!("ERR field '{}' does not exist", field_name));
+    }
+
+    let key = schema_key(table);
+    store.hdel(key.as_bytes(), &[field_name.as_bytes()], now)?;
+
+    let row_ids = get_all_row_ids(store, table, now);
+    for id in row_ids {
+        let rk = row_key(table, id);
+        let _ = store.hdel(rk.as_bytes(), &[field_name.as_bytes()], now);
+    }
+
+    let idx_key = idx_sorted_key(table, field_name);
+    store.del(&[idx_key.as_bytes()]);
+
+    let ukey = uniq_key(table, field_name);
+    store.del(&[ukey.as_bytes()]);
+
+    Ok(())
 }
 
 pub fn table_list(store: &Store, now: Instant) -> Vec<String> {
@@ -691,7 +797,7 @@ fn matches_condition(row: &[(String, String)], cond: &WhereClause, field_def: &F
     };
 
     match &field_def.field_type {
-        FieldType::Int | FieldType::Ref(_) => {
+        FieldType::Int | FieldType::Bool | FieldType::Timestamp | FieldType::Ref(_) => {
             let lhs: i64 = val.parse().unwrap_or(0);
             let rhs: i64 = cond.value.parse().unwrap_or(0);
             match cond.op {
@@ -746,7 +852,11 @@ fn candidates_from_index(
             }
             None
         }
-        FieldType::Int | FieldType::Float | FieldType::Ref(_) => {
+        FieldType::Int
+        | FieldType::Float
+        | FieldType::Bool
+        | FieldType::Timestamp
+        | FieldType::Ref(_) => {
             let score: f64 = match cond.value.parse() {
                 Ok(v) => v,
                 Err(_) => return None,
@@ -858,7 +968,7 @@ pub fn table_query(
                     .unwrap_or("");
             let cmp = if let Some(fd) = field_def {
                 match &fd.field_type {
-                    FieldType::Int | FieldType::Ref(_) => {
+                    FieldType::Int | FieldType::Bool | FieldType::Timestamp | FieldType::Ref(_) => {
                         let ai: i64 = av.parse().unwrap_or(0);
                         let bi: i64 = bv.parse().unwrap_or(0);
                         ai.cmp(&bi)

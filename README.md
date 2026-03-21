@@ -70,7 +70,8 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 
 ## Features
 
-- **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, HyperLogLog, bitops, pub/sub, transactions
+- **200+ commands** -- strings, lists, hashes, sets, sorted sets, streams, vectors, geo, time series, tables, HyperLogLog, bitops, pub/sub, transactions
+- **Relational tables** -- TCREATE, TINSERT, TQUERY, TALTER with typed fields (str, int, float, bool, timestamp), unique constraints, foreign keys, joins, WHERE/ORDER BY/LIMIT. Structured data without standing up Postgres
 - **Realtime key subscriptions** -- KSUB/KUNSUB: subscribe to key patterns, receive events when matching keys are mutated. Zero overhead when unused. No global config flags, no separate services. Unlike Redis keyspace notifications which tax every write globally, KSUB is surgical and async
 - **Native time series** -- TSADD, TSGET, TSRANGE, TSMRANGE with aggregation (avg, sum, min, max, count, std), retention policies, and label-based filtering. No modules, no sidecars. TSGET 4x faster than Redis GET
 - **Native vector search** -- VSET, VGET, VSEARCH with cosine similarity and metadata filtering. No extensions, no sidecars
@@ -197,6 +198,33 @@ Events are `["kmessage", pattern, key, operation]`. Operations are lowercase com
 
 Built for reactive applications, cache invalidation, live dashboards, and any use case where you need to react to data changes without polling.
 
+### Tables
+
+Built-in relational tables with typed fields, indexes, unique constraints, foreign keys, and joins.
+
+```bash
+# Create a table with typed fields
+redis-cli TCREATE users name:str email:str:unique age:int active:bool created_at:timestamp
+
+# Insert rows (* auto-generates timestamp)
+redis-cli TINSERT users name Alice email alice@example.com age 28 active true created_at *
+redis-cli TINSERT users name Bob email bob@example.com age 35 active false created_at *
+
+# Query with WHERE, ORDER BY, LIMIT
+redis-cli TQUERY users WHERE age > 25 ORDER BY age DESC
+
+# Foreign keys and joins
+redis-cli TCREATE posts title:str author:ref(users)
+redis-cli TINSERT posts title "Hello World" author 1
+redis-cli TQUERY posts JOIN author
+
+# Alter tables
+redis-cli TALTER users ADD role:str
+redis-cli TALTER users DROP role
+```
+
+Field types: `str`, `int`, `float`, `bool`, `timestamp`, `ref(table)`. Supports `:unique` constraint.
+
 ### CLI
 
 ```bash
@@ -301,7 +329,7 @@ rdb.Set(ctx, "hello", "world", 0)
 
 ## Testing
 
-Lux has 332 tests across unit and integration suites.
+Lux has 349 tests across unit and integration suites.
 
 ```bash
 cargo test
@@ -327,6 +355,7 @@ cargo test
 | **Integration: hll** | 9 | PFADD, PFCOUNT, PFMERGE, cardinality accuracy, multi-key count, merge, WRONGTYPE |
 | **Integration: timeseries** | 18 | TSADD, TSGET, TSRANGE, TSMRANGE, TSMADD, TSINFO, aggregation, retention, labels, filtering |
 | **Integration: ksub** | 6 | KSUB event delivery, pattern filtering, multiple patterns, KUNSUB, HSET/DEL events |
+| **Integration: tables** | 14 | TCREATE, TINSERT, TGET, TQUERY, TUPDATE, TDEL, TDROP, TCOUNT, TLIST, TSCHEMA, joins, foreign keys, unique constraints |
 | **Valkey compat** | 10+ | Valkey multi.tcl test suite run against Lux |
 
 Run the benchmark against Redis:
@@ -373,6 +402,8 @@ Release and Docker builds only proceed after tests pass.
 **Transactions:** `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH`
 
 **Vectors:** `VSET` `VGET` `VSEARCH` `VCARD`
+
+**Tables:** `TCREATE` `TINSERT` `TGET` `TQUERY` `TUPDATE` `TDEL` `TDROP` `TCOUNT` `TSCHEMA` `TLIST` `TALTER`
 
 **Scripting:** `EVAL` `EVALSHA` `SCRIPT LOAD` `SCRIPT EXISTS` `SCRIPT FLUSH`
 

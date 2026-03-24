@@ -78,6 +78,26 @@ enum Commands {
         #[arg(long, help = "Check for updates without installing")]
         check: bool,
     },
+    Migrate {
+        #[command(subcommand)]
+        action: MigrateAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigrateAction {
+    New {
+        #[arg(help = "Migration name (e.g. create_users)")]
+        name: String,
+    },
+    Status {
+        #[arg(help = "Project name or ID")]
+        project: String,
+    },
+    Run {
+        #[arg(help = "Project name or ID")]
+        project: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -877,5 +897,233 @@ async fn main() {
             std::fs::remove_dir_all(&tmp_dir).ok();
             println!("{} Updated to v{latest_version}", "Done.".green());
         }
+
+        Commands::Migrate { action } => match action {
+            MigrateAction::New { name } => {
+                let dir = PathBuf::from("lux/migrations");
+                std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to create migrations dir:".red());
+                    std::process::exit(1);
+                });
+                let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+                let filename = format!("{}_{}.lux", ts, name);
+                let path = dir.join(&filename);
+                std::fs::write(&path, "").unwrap_or_else(|e| {
+                    eprintln!("{} {e}", "Failed to create file:".red());
+                    std::process::exit(1);
+                });
+                println!("{} {}", "Created:".green(), path.display());
+            }
+
+            MigrateAction::Status { project } => {
+                let (client, api_url, token) = get_client(&api_url_override);
+                let inst = find_project(&client, &api_url, &token, &project).await;
+
+                let applied = get_applied_migrations(&client, &api_url, &token, &inst.id).await;
+                let local = get_local_migrations();
+
+                if local.is_empty() {
+                    println!("{}", "No migration files found in lux/migrations/".dimmed());
+                    return;
+                }
+
+                println!("  {:<40}  {}", "MIGRATION".dimmed(), "STATUS".dimmed());
+                for (filename, _) in &local {
+                    let status = if applied.contains(filename) {
+                        "applied".green().to_string()
+                    } else {
+                        "pending".yellow().to_string()
+                    };
+                    println!("  {:<40}  {}", filename, status);
+                }
+            }
+
+            MigrateAction::Run { project } => {
+                let (client, api_url, token) = get_client(&api_url_override);
+                let inst = find_project(&client, &api_url, &token, &project).await;
+
+                ensure_migrations_table(&client, &api_url, &token, &inst.id).await;
+
+                let applied = get_applied_migrations(&client, &api_url, &token, &inst.id).await;
+                let local = get_local_migrations();
+
+                let pending: Vec<_> = local
+                    .iter()
+                    .filter(|(name, _)| !applied.contains(name))
+                    .collect();
+
+                if pending.is_empty() {
+                    println!("{}", "All migrations are applied.".green());
+                    return;
+                }
+
+                println!(
+                    "{} {} pending migration(s)",
+                    "Running".bold(),
+                    pending.len()
+                );
+
+                for (filename, content) in &pending {
+                    print!("  {} {}...", "Applying".dimmed(), filename);
+                    std::io::stdout().flush().ok();
+
+                    let lines: Vec<&str> = content
+                        .lines()
+                        .map(|l| l.trim())
+                        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("--"))
+                        .collect();
+
+                    let mut failed = false;
+                    for line in &lines {
+                        let res = exec_command(&client, &api_url, &token, &inst.id, line).await;
+                        if let Some(err) = res {
+                            if err.starts_with("ERR") || err.starts_with("-") {
+                                println!(" {}", "FAILED".red());
+                                eprintln!("    {} {}", "Command:".dimmed(), line);
+                                eprintln!("    {} {}", "Error:".red(), err);
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if failed {
+                        eprintln!(
+                            "\n{} Migration failed. Fix the issue and re-run.",
+                            "Error:".red()
+                        );
+                        std::process::exit(1);
+                    }
+
+                    let checksum = simple_hash(content);
+                    let record_cmd = format!(
+                        "TINSERT __migrations filename {} checksum {} applied_at {}",
+                        filename,
+                        checksum,
+                        chrono::Utc::now().timestamp()
+                    );
+                    exec_command(&client, &api_url, &token, &inst.id, &record_cmd).await;
+
+                    println!(" {}", "OK".green());
+                }
+
+                println!(
+                    "{} Applied {} migration(s).",
+                    "Done.".green(),
+                    pending.len()
+                );
+            }
+        },
     }
+}
+
+async fn exec_command(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+    command: &str,
+) -> Option<String> {
+    let res = client
+        .post(format!("{api_url}/console/{instance_id}/exec"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "command": command }))
+        .send()
+        .await
+        .ok()?;
+
+    let body: serde_json::Value = res.json().await.ok()?;
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        return Some(err.to_string());
+    }
+    body.get("output")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+async fn ensure_migrations_table(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+) {
+    let check = exec_command(client, api_url, token, instance_id, "TSCHEMA __migrations").await;
+    if check.is_none()
+        || check.as_deref() == Some("")
+        || check.as_deref().unwrap_or("").contains("ERR")
+    {
+        exec_command(
+            client,
+            api_url,
+            token,
+            instance_id,
+            "TCREATE __migrations filename:str checksum:str applied_at:int",
+        )
+        .await;
+    }
+}
+
+async fn get_applied_migrations(
+    client: &reqwest::Client,
+    api_url: &str,
+    token: &str,
+    instance_id: &str,
+) -> std::collections::HashSet<String> {
+    let mut applied = std::collections::HashSet::new();
+    let result = exec_command(
+        client,
+        api_url,
+        token,
+        instance_id,
+        "TQUERY __migrations ORDER BY id ASC LIMIT 1000",
+    )
+    .await;
+
+    if let Some(output) = result {
+        for line in output.lines() {
+            if let Some(pos) = line.find("filename") {
+                let rest = &line[pos + 8..];
+                let name = rest.split_whitespace().next().unwrap_or("");
+                if !name.is_empty() {
+                    applied.insert(name.to_string());
+                }
+            }
+        }
+    }
+    applied
+}
+
+fn get_local_migrations() -> Vec<(String, String)> {
+    let dir = PathBuf::from("lux/migrations");
+    if !dir.exists() {
+        return vec![];
+    }
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|_| {
+            eprintln!("{}", "Failed to read lux/migrations/".red());
+            std::process::exit(1);
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "lux")
+                .unwrap_or(false)
+        })
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let content = std::fs::read_to_string(e.path()).unwrap_or_default();
+            (name, content)
+        })
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+fn simple_hash(content: &str) -> String {
+    let mut hash: u64 = 5381;
+    for byte in content.bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
+    }
+    format!("{:016x}", hash)
 }

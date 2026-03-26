@@ -237,6 +237,11 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
          used_disk_bytes:{}\r\n\
          disk_keys:{}\r\n\
          \r\n\
+         # Persistence\r\n\
+         persistence_err_wal_append:{}\r\n\
+         persistence_err_wal_fsync:{}\r\n\
+         persistence_err_disk_write:{}\r\n\
+         \r\n\
          # Keyspace\r\n\
          db0:keys={},expires=0,avg_ttl=0\r\n\
          keys:{}\r\n\
@@ -254,6 +259,9 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
         },
         store.disk_usage_bytes(),
         store.disk_key_count(),
+        crate::store::PERSISTENCE_ERR_WAL_APPEND.load(Ordering::Relaxed),
+        crate::store::PERSISTENCE_ERR_WAL_FSYNC.load(Ordering::Relaxed),
+        crate::store::PERSISTENCE_ERR_DISK_WRITE.load(Ordering::Relaxed),
         store.dbsize(now),
         store.dbsize(now),
         store.vcard(now)

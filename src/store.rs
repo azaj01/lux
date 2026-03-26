@@ -10,6 +10,12 @@ use std::time::{Duration, Instant, SystemTime};
 pub static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
 pub static LRU_CLOCK: AtomicU32 = AtomicU32::new(0);
 
+/// Persistence error counters. Exposed via INFO command so operators can
+/// monitor and alert on silent data-safety issues.
+pub static PERSISTENCE_ERR_WAL_APPEND: AtomicUsize = AtomicUsize::new(0);
+pub static PERSISTENCE_ERR_WAL_FSYNC: AtomicUsize = AtomicUsize::new(0);
+pub static PERSISTENCE_ERR_DISK_WRITE: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
     pub ms: u64,
@@ -352,7 +358,12 @@ impl Store {
                 let disk_idx = (fx_hash(key.as_bytes()) % disk_shards.len() as u64) as usize;
                 let mut disk = disk_shards[disk_idx].lock();
                 if let Err(e) = disk.put(key, &dump) {
-                    eprintln!("CRITICAL: disk write failed, keeping entry in memory: {e}");
+                    PERSISTENCE_ERR_DISK_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "CRITICAL: disk eviction write failed for key '{}', keeping in memory. \
+                         Data will be LOST on restart if not re-evicted successfully: {e}",
+                        key
+                    );
                     return;
                 }
                 if disk.should_compact() {
@@ -492,18 +503,42 @@ impl Store {
     /// Append a command to the per-shard WAL. Uses the key (args[1]) to
     /// determine which shard's WAL to write to. Suppressed during WAL replay
     /// and snapshot loading to prevent re-logging replayed commands.
+    ///
+    /// Global commands (FLUSHDB, FLUSHALL) are written to ALL WAL shards
+    /// since they affect the entire keyspace.
     pub fn wal_log_command(&self, args: &[&[u8]]) {
         if self.wal_suppress.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        if args.len() < 2 {
+        if args.is_empty() {
             return;
         }
         if let Some(ref ws) = self.wal_shards {
-            let idx = self.disk_shard_index(args[1]);
-            let mut wal = ws[idx].lock();
-            if let Err(e) = wal.append_command(args) {
-                eprintln!("WAL write error: {e}");
+            let cmd = args[0];
+            let is_global =
+                cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL");
+
+            if is_global {
+                // Write to ALL shards so replay on any shard triggers the flush.
+                for w in ws.iter() {
+                    let mut wal = w.lock();
+                    if let Err(e) = wal.append_command(args) {
+                        PERSISTENCE_ERR_WAL_APPEND
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!(
+                            "CRITICAL: WAL append failed, in-memory mutation will not survive crash: {e}"
+                        );
+                    }
+                }
+            } else if args.len() >= 2 {
+                let idx = self.disk_shard_index(args[1]);
+                let mut wal = ws[idx].lock();
+                if let Err(e) = wal.append_command(args) {
+                    PERSISTENCE_ERR_WAL_APPEND.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "CRITICAL: WAL append failed, in-memory mutation will not survive crash: {e}"
+                    );
+                }
             }
         }
     }
@@ -567,8 +602,9 @@ impl Store {
                 let mut entries = Vec::new();
                 for d in ds.iter() {
                     let mut disk = d.lock();
-                    if let Ok(mut de) = disk.dump_all(now) {
-                        entries.append(&mut de);
+                    match disk.dump_all(now) {
+                        Ok(mut de) => entries.append(&mut de),
+                        Err(e) => eprintln!("CRITICAL: failed to dump disk shard during snapshot, cold data may be lost: {e}"),
                     }
                 }
                 entries
@@ -584,7 +620,12 @@ impl Store {
         if let Some(ref ws) = self.wal_shards {
             for w in ws.iter() {
                 let mut wal = w.lock();
-                wal.fsync().ok();
+                if let Err(e) = wal.fsync() {
+                    PERSISTENCE_ERR_WAL_FSYNC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "CRITICAL: WAL fsync failed, up to 1s of writes may not be durable: {e}"
+                    );
+                }
             }
         }
     }
@@ -4704,6 +4745,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 pub type StreamDumpEntry = (String, Vec<(String, Vec<u8>)>);
 
+#[derive(Debug)]
 pub enum DumpValue {
     Str(Vec<u8>),
     List(Vec<Vec<u8>>),
@@ -4716,6 +4758,7 @@ pub enum DumpValue {
     TimeSeries(Vec<(i64, f64)>, u64, Vec<(String, String)>),
 }
 
+#[derive(Debug)]
 pub struct DumpEntry {
     pub key: String,
     pub value: DumpValue,

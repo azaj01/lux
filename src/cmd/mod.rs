@@ -848,7 +848,7 @@ pub fn execute_with_wal(
     out: &mut BytesMut,
     now: Instant,
 ) -> CmdResult {
-    if args.len() > 1 && crate::eviction::is_write_command(args[0]) {
+    if !args.is_empty() && crate::eviction::is_write_command(args[0]) {
         store.wal_log_command(args);
     }
     execute(store, broker, args, out, now)

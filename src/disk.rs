@@ -13,6 +13,37 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+// Magic bytes written at the start of WAL and data files to identify the
+// checksummed format (v2). Files without this magic are treated as legacy.
+const WAL_MAGIC: &[u8; 4] = b"LXW1";
+const DATA_MAGIC: &[u8; 4] = b"LXD1";
+
+/// CRC32 (ISO 3309 / ITU-T V.42) computed with a lookup table.
+/// Used to detect corruption in WAL frames and disk entries.
+fn crc32(data: &[u8]) -> u32 {
+    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for i in 0..256u32 {
+            let mut crc = i;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ 0xEDB8_8320;
+                } else {
+                    crc >>= 1;
+                }
+            }
+            t[i as usize] = crc;
+        }
+        t
+    });
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StorageMode {
     /// All data in memory. Eviction deletes permanently. Zero disk overhead.
@@ -52,9 +83,12 @@ pub fn storage_config() -> &'static StorageConfig {
 /// is replayed by re-executing each command. Truncated after each snapshot
 /// since the snapshot contains all data.
 ///
-/// Frame format: [4B frame_len][4B argc][for each arg: 4B len + bytes]
+/// v2 frame format: [4B frame_len][4B crc32][4B argc][for each arg: 4B len + bytes]
+/// Legacy format:   [4B frame_len][4B argc][for each arg: 4B len + bytes]
 pub struct Wal {
     file: File,
+    /// True if this WAL file starts with WAL_MAGIC (v2 checksummed format).
+    has_checksums: bool,
 }
 
 impl Wal {
@@ -62,29 +96,69 @@ impl Wal {
         let shard_dir = dir.join(format!("shard_{shard_id}"));
         fs::create_dir_all(&shard_dir)?;
         let path = shard_dir.join("wal.lux");
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&path)?;
-        Ok(Wal { file })
+
+        let file_len = file.seek(SeekFrom::End(0))?;
+        let has_checksums = if file_len == 0 {
+            // New file: write magic header and start in v2 mode.
+            file.write_all(WAL_MAGIC)?;
+            file.flush()?;
+            true
+        } else {
+            // Existing file: check for magic.
+            file.seek(SeekFrom::Start(0))?;
+            let mut magic = [0u8; 4];
+            if file.read_exact(&mut magic).is_ok() && &magic == WAL_MAGIC {
+                file.seek(SeekFrom::End(0))?;
+                true
+            } else {
+                file.seek(SeekFrom::End(0))?;
+                false
+            }
+        };
+
+        Ok(Wal {
+            file,
+            has_checksums,
+        })
     }
 
-    /// Append a command to the WAL. Flushed to OS buffer immediately;
-    /// fsync'd to disk by a background task every 1 second.
+    /// Append a command to the WAL. Builds the entire frame in memory and
+    /// writes it in a single call to minimize partial-write risk. If the
+    /// write fails (e.g. ENOSPC), truncates back to the pre-write position
+    /// so the WAL stays clean for the next attempt.
     pub fn append_command(&mut self, args: &[&[u8]]) -> io::Result<()> {
-        let mut buf = Vec::new();
+        let mut payload = Vec::new();
         let argc = args.len() as u32;
-        buf.extend_from_slice(&argc.to_le_bytes());
+        payload.extend_from_slice(&argc.to_le_bytes());
         for arg in args {
             let len = arg.len() as u32;
-            buf.extend_from_slice(&len.to_le_bytes());
-            buf.extend_from_slice(arg);
+            payload.extend_from_slice(&len.to_le_bytes());
+            payload.extend_from_slice(arg);
         }
-        let frame_len = buf.len() as u32;
-        self.file.write_all(&frame_len.to_le_bytes())?;
-        self.file.write_all(&buf)?;
-        self.file.flush()
+
+        let checksum = crc32(&payload);
+        let frame_len = (4 + payload.len()) as u32;
+
+        // Build complete frame in one buffer to minimize partial-write window.
+        let mut frame = Vec::with_capacity(4 + 4 + payload.len());
+        frame.extend_from_slice(&frame_len.to_le_bytes());
+        frame.extend_from_slice(&checksum.to_le_bytes());
+        frame.extend_from_slice(&payload);
+
+        let pos_before = self.file.stream_position()?;
+        if let Err(e) = self.file.write_all(&frame).and_then(|_| self.file.flush()) {
+            // Truncate back to clean position so partial bytes don't
+            // corrupt future appends or waste space.
+            let _ = self.file.set_len(pos_before);
+            let _ = self.file.seek(SeekFrom::End(0));
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn fsync(&mut self) -> io::Result<()> {
@@ -92,14 +166,23 @@ impl Wal {
     }
 
     /// Read all commands from the WAL for replay. Partial/corrupt frames
-    /// (from a crash mid-write) are safely skipped due to length-prefixed framing.
+    /// (from a crash mid-write) are safely skipped. Checksummed frames (v2)
+    /// are validated; frames with bad checksums are rejected with a warning.
     pub fn replay(&mut self) -> io::Result<Vec<Vec<Vec<u8>>>> {
         let file_len = self.file.seek(SeekFrom::End(0))?;
         if file_len == 0 {
             return Ok(Vec::new());
         }
-        self.file.seek(SeekFrom::Start(0))?;
+
+        // Skip past magic header if present.
+        if self.has_checksums {
+            self.file.seek(SeekFrom::Start(4))?;
+        } else {
+            self.file.seek(SeekFrom::Start(0))?;
+        }
+
         let mut commands = Vec::new();
+        let mut corrupted = 0usize;
 
         loop {
             let frame_len = match read_u32(&mut self.file) {
@@ -111,10 +194,30 @@ impl Wal {
             let mut buf = vec![0u8; frame_len];
             match self.file.read_exact(&mut buf) {
                 Ok(()) => {}
-                Err(_) => break,
+                Err(_) => break, // partial frame at end (crash mid-write)
             }
 
-            let mut cursor = &buf[..];
+            let payload = if self.has_checksums {
+                if buf.len() < 4 {
+                    corrupted += 1;
+                    continue;
+                }
+                let stored_crc = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                let data = &buf[4..];
+                let computed_crc = crc32(data);
+                if stored_crc != computed_crc {
+                    corrupted += 1;
+                    eprintln!(
+                        "WAL: corrupted frame detected (crc mismatch: stored={stored_crc:#010x} computed={computed_crc:#010x}), skipping"
+                    );
+                    continue;
+                }
+                &buf[4..]
+            } else {
+                &buf[..]
+            };
+
+            let mut cursor = payload;
             let argc = match read_u32(&mut cursor) {
                 Ok(n) => n as usize,
                 Err(_) => continue,
@@ -135,13 +238,21 @@ impl Wal {
                 commands.push(args);
             }
         }
+        if corrupted > 0 {
+            eprintln!("WAL: skipped {corrupted} corrupted frame(s) during replay");
+        }
         self.file.seek(SeekFrom::End(0))?;
         Ok(commands)
     }
 
     pub fn truncate(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
-        self.file.seek(SeekFrom::Start(0)).map(|_| ())
+        self.file.seek(SeekFrom::Start(0))?;
+        // Re-write magic so new appends are checksummed.
+        self.file.write_all(WAL_MAGIC)?;
+        self.file.flush()?;
+        self.has_checksums = true;
+        Ok(())
     }
 }
 
@@ -183,6 +294,9 @@ impl DiskEntry {
 /// - In-memory index: HashMap<key, file_offset> for O(1) lookups without scanning
 /// - Compaction: periodic rewrite drops dead bytes from overwritten/deleted entries
 ///
+/// v2 entry envelope: [4B entry_len][4B crc32][entry_data...]
+/// Legacy: raw entry_data bytes (no envelope).
+///
 /// Protected by a Mutex in Store. Accessed only on eviction (write) and
 /// cache miss (read), both cold paths. Never blocks the in-memory shard RwLock.
 pub struct DiskShard {
@@ -195,6 +309,8 @@ pub struct DiskShard {
     /// When this exceeds 30% of total_bytes, compaction triggers.
     dead_bytes: usize,
     total_bytes: usize,
+    /// True if this data file uses the v2 checksummed envelope format.
+    has_checksums: bool,
 }
 
 impl DiskShard {
@@ -204,11 +320,28 @@ impl DiskShard {
         let shard_dir = dir.join(format!("shard_{shard_id}"));
         fs::create_dir_all(&shard_dir)?;
         let path = shard_dir.join("data.lux");
-        let data_file = OpenOptions::new()
+        let mut data_file = OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&path)?;
+
+        let file_len = data_file.seek(SeekFrom::End(0))?;
+        let has_checksums = if file_len == 0 {
+            data_file.write_all(DATA_MAGIC)?;
+            data_file.flush()?;
+            true
+        } else {
+            data_file.seek(SeekFrom::Start(0))?;
+            let mut magic = [0u8; 4];
+            if data_file.read_exact(&mut magic).is_ok() && &magic == DATA_MAGIC {
+                data_file.seek(SeekFrom::End(0))?;
+                true
+            } else {
+                data_file.seek(SeekFrom::End(0))?;
+                false
+            }
+        };
 
         let mut ds = DiskShard {
             index: HashMap::new(),
@@ -216,6 +349,7 @@ impl DiskShard {
             path,
             dead_bytes: 0,
             total_bytes: 0,
+            has_checksums,
         };
         ds.rebuild_index()?;
         Ok(ds)
@@ -223,33 +357,54 @@ impl DiskShard {
 
     /// Serialize and append an entry to the data file. If the key already
     /// exists on disk (re-eviction), the old bytes become dead and the index
-    /// points to the new copy.
+    /// points to the new copy. Writes the entire envelope in a single call
+    /// and truncates back on failure to avoid leaving partial entries.
+    ///
+    /// v2 envelope: [4B entry_len][4B crc32][entry_data...]
     pub fn put(&mut self, key: &str, dump: &DumpEntry) -> io::Result<()> {
-        let offset = self.total_bytes as u64;
-        let mut buf = Vec::new();
-        write_single_entry(&mut buf, dump)?;
-        let length = buf.len() as u32;
+        let file_offset = self.total_bytes as u64;
+        let mut entry_data = Vec::new();
+        write_single_entry(&mut entry_data, dump)?;
 
-        self.data_file.write_all(&buf)?;
-        self.data_file.flush()?;
+        let checksum = crc32(&entry_data);
+        let entry_len = entry_data.len() as u32;
+        let total_on_disk = 4 + 4 + entry_data.len();
+
+        // Build complete envelope in one buffer.
+        let mut buf = Vec::with_capacity(total_on_disk);
+        buf.extend_from_slice(&entry_len.to_le_bytes());
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf.extend_from_slice(&entry_data);
+
+        if let Err(e) = self
+            .data_file
+            .write_all(&buf)
+            .and_then(|_| self.data_file.flush())
+        {
+            // Truncate partial bytes so the data file stays clean.
+            let _ = self.data_file.set_len(file_offset);
+            let _ = self.data_file.seek(SeekFrom::End(0));
+            return Err(e);
+        }
 
         if let Some(old) = self.index.insert(
             key.to_string(),
             DiskEntry {
-                offset,
-                length,
+                offset: file_offset,
+                length: total_on_disk as u32,
                 ttl_ms: if dump.ttl_ms > 0 { dump.ttl_ms } else { -1 },
                 created_at: Instant::now(),
             },
         ) {
             self.dead_bytes += old.length as usize;
         }
-        self.total_bytes += length as usize;
+        self.total_bytes += total_on_disk;
         Ok(())
     }
 
     /// Read an entry from disk by seeking to its offset in the data file.
     /// Returns None if the key isn't in the index or has expired.
+    /// Validates CRC32 checksum for v2 entries.
     pub fn get(
         &mut self,
         key: &str,
@@ -275,7 +430,32 @@ impl DiskShard {
         reader.seek(SeekFrom::Start(offset))?;
         reader.read_exact(&mut buf)?;
 
-        let mut cursor = &buf[..];
+        let entry_data = if self.has_checksums {
+            // Envelope: [4B entry_len][4B crc32][entry_data...]
+            if buf.len() < 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "disk entry too short for checksum envelope",
+                ));
+            }
+            let stored_crc = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let data = &buf[8..];
+            let computed_crc = crc32(data);
+            if stored_crc != computed_crc {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "disk entry checksum mismatch for key '{key}' \
+                         (stored={stored_crc:#010x} computed={computed_crc:#010x})"
+                    ),
+                ));
+            }
+            data
+        } else {
+            &buf[..]
+        };
+
+        let mut cursor = entry_data;
         let (_key, value, _ttl_ms) = read_single_entry(&mut cursor)?;
         let ttl = if remaining > 0 {
             Some(Duration::from_millis(remaining as u64))
@@ -327,34 +507,54 @@ impl DiskShard {
 
     /// Rewrite the data file keeping only live entries. Creates a new file,
     /// copies live data, then atomic-renames over the old file. Reclaims all
-    /// dead bytes from overwritten/deleted entries.
+    /// dead bytes from overwritten/deleted entries. Always writes v2 format
+    /// with magic header and checksummed envelopes (upgrades legacy files).
     pub fn compact(&mut self) -> io::Result<()> {
         let tmp_path = self.path.with_extension("compact.tmp");
         let tmp_file = File::create(&tmp_path)?;
         let mut writer = BufWriter::new(tmp_file);
 
+        // Always write magic header -- compaction upgrades legacy to v2.
+        writer.write_all(DATA_MAGIC)?;
+        let mut new_total: usize = 4; // magic header size
         let mut new_index = HashMap::new();
-        let mut new_total: usize = 0;
 
         let keys: Vec<String> = self.index.keys().cloned().collect();
         for key in &keys {
             let de = &self.index[key];
+
+            // Read existing entry and extract the raw entry_data.
             let mut buf = vec![0u8; de.length as usize];
             self.data_file.seek(SeekFrom::Start(de.offset))?;
             self.data_file.read_exact(&mut buf)?;
 
+            let entry_data = if self.has_checksums {
+                // Skip the 4B entry_len + 4B crc envelope, re-serialize fresh.
+                buf[8..].to_vec()
+            } else {
+                buf
+            };
+
+            // Write v2 envelope: [4B entry_len][4B crc32][entry_data]
+            let checksum = crc32(&entry_data);
+            let entry_len = entry_data.len() as u32;
+            let total_on_disk = 4 + 4 + entry_data.len();
+
             let new_offset = new_total as u64;
-            writer.write_all(&buf)?;
+            writer.write_all(&entry_len.to_le_bytes())?;
+            writer.write_all(&checksum.to_le_bytes())?;
+            writer.write_all(&entry_data)?;
+
             new_index.insert(
                 key.clone(),
                 DiskEntry {
                     offset: new_offset,
-                    length: de.length,
+                    length: total_on_disk as u32,
                     ttl_ms: de.ttl_ms,
                     created_at: de.created_at,
                 },
             );
-            new_total += de.length as usize;
+            new_total += total_on_disk;
         }
 
         writer.flush()?;
@@ -368,6 +568,7 @@ impl DiskShard {
         self.index = new_index;
         self.total_bytes = new_total;
         self.dead_bytes = 0;
+        self.has_checksums = true;
         Ok(())
     }
 
@@ -390,38 +591,109 @@ impl DiskShard {
     /// wins and earlier ones become dead bytes.
     fn rebuild_index(&mut self) -> io::Result<()> {
         let file_len = self.data_file.seek(SeekFrom::End(0))?;
-        if file_len == 0 {
+        let header_size: u64 = if self.has_checksums { 4 } else { 0 };
+        if file_len <= header_size {
+            self.total_bytes = header_size as usize;
             return Ok(());
         }
-        self.data_file.seek(SeekFrom::Start(0))?;
+        self.data_file.seek(SeekFrom::Start(header_size))?;
+        self.total_bytes = header_size as usize;
         let now = Instant::now();
+        let mut corrupted = 0usize;
 
-        loop {
-            let start = self.data_file.stream_position()?;
-            if start >= file_len {
-                break;
-            }
-            match read_single_entry(&mut self.data_file) {
-                Ok((key, _value, ttl_ms)) => {
-                    let end_pos = self.data_file.stream_position()?;
-                    let length = (end_pos - start) as u32;
-
-                    if let Some(old) = self.index.insert(
-                        key,
-                        DiskEntry {
-                            offset: start,
-                            length,
-                            ttl_ms,
-                            created_at: now,
-                        },
-                    ) {
-                        self.dead_bytes += old.length as usize;
-                    }
-                    self.total_bytes += length as usize;
+        if self.has_checksums {
+            // v2 format: [4B entry_len][4B crc32][entry_data...]
+            loop {
+                let start = self.data_file.stream_position()?;
+                if start >= file_len {
+                    break;
                 }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
+                let entry_len = match read_u32(&mut self.data_file) {
+                    Ok(l) => l as usize,
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                };
+                let stored_crc = match read_u32(&mut self.data_file) {
+                    Ok(c) => c,
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                };
+
+                let mut entry_data = vec![0u8; entry_len];
+                match self.data_file.read_exact(&mut entry_data) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
+
+                let computed_crc = crc32(&entry_data);
+                if stored_crc != computed_crc {
+                    corrupted += 1;
+                    eprintln!("disk: corrupted entry at offset {start} (crc mismatch), skipping");
+                    let total_on_disk = 4 + 4 + entry_len;
+                    self.dead_bytes += total_on_disk;
+                    self.total_bytes += total_on_disk;
+                    continue;
+                }
+
+                let mut cursor = &entry_data[..];
+                match read_single_entry(&mut cursor) {
+                    Ok((key, _value, ttl_ms)) => {
+                        let total_on_disk = 4 + 4 + entry_len;
+                        if let Some(old) = self.index.insert(
+                            key,
+                            DiskEntry {
+                                offset: start,
+                                length: total_on_disk as u32,
+                                ttl_ms,
+                                created_at: now,
+                            },
+                        ) {
+                            self.dead_bytes += old.length as usize;
+                        }
+                        self.total_bytes += total_on_disk;
+                    }
+                    Err(e) => {
+                        eprintln!("disk: failed to parse entry at offset {start}: {e}");
+                        let total_on_disk = 4 + 4 + entry_len;
+                        self.dead_bytes += total_on_disk;
+                        self.total_bytes += total_on_disk;
+                    }
+                }
             }
+        } else {
+            // Legacy format: raw read_single_entry bytes, no envelope.
+            loop {
+                let start = self.data_file.stream_position()?;
+                if start >= file_len {
+                    break;
+                }
+                match read_single_entry(&mut self.data_file) {
+                    Ok((key, _value, ttl_ms)) => {
+                        let end_pos = self.data_file.stream_position()?;
+                        let length = (end_pos - start) as u32;
+
+                        if let Some(old) = self.index.insert(
+                            key,
+                            DiskEntry {
+                                offset: start,
+                                length,
+                                ttl_ms,
+                                created_at: now,
+                            },
+                        ) {
+                            self.dead_bytes += old.length as usize;
+                        }
+                        self.total_bytes += length as usize;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        if corrupted > 0 {
+            eprintln!("disk: skipped {corrupted} corrupted entry/entries during index rebuild");
         }
         self.data_file.seek(SeekFrom::End(0))?;
         Ok(())
@@ -679,4 +951,572 @@ pub fn read_single_entry(r: &mut impl Read) -> io::Result<(String, DumpValue, i6
     };
 
     Ok((key, value, ttl_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc32_known_values() {
+        // "123456789" should produce 0xCBF43926 per the CRC32 spec.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        // Empty input should produce 0x00000000.
+        assert_eq!(crc32(b""), 0x0000_0000);
+    }
+
+    #[test]
+    fn disk_shard_roundtrip_with_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = DumpEntry {
+            key: "hello".to_string(),
+            value: DumpValue::Str(b"world".to_vec()),
+            ttl_ms: -1,
+        };
+
+        {
+            let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+            assert!(ds.has_checksums);
+            ds.put("hello", &entry).unwrap();
+        }
+
+        // Re-open and rebuild index from disk.
+        {
+            let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+            assert!(ds.has_checksums);
+            assert_eq!(ds.len(), 1);
+            let (value, ttl) = ds.get("hello", Instant::now()).unwrap().unwrap();
+            assert!(matches!(value, DumpValue::Str(ref v) if v == b"world"));
+            assert!(ttl.is_none());
+        }
+    }
+
+    #[test]
+    fn disk_shard_detects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = DumpEntry {
+            key: "foo".to_string(),
+            value: DumpValue::Str(b"bar".to_vec()),
+            ttl_ms: -1,
+        };
+
+        {
+            let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+            ds.put("foo", &entry).unwrap();
+        }
+
+        // Corrupt a byte in the data file (after the magic header + envelope header).
+        let data_path = dir.path().join("shard_0/data.lux");
+        let mut data = fs::read(&data_path).unwrap();
+        // Flip a byte in the entry data region (offset 4 magic + 4 len + 4 crc + some data).
+        if data.len() > 14 {
+            data[14] ^= 0xFF;
+        }
+        fs::write(&data_path, &data).unwrap();
+
+        // Re-open: rebuild_index should skip the corrupted entry.
+        let ds = DiskShard::open(dir.path(), 0).unwrap();
+        assert_eq!(ds.len(), 0, "corrupted entry should have been skipped");
+        assert!(
+            ds.dead_bytes > 0,
+            "corrupted entry should count as dead bytes"
+        );
+    }
+
+    #[test]
+    fn wal_roundtrip_with_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            assert!(wal.has_checksums);
+            wal.append_command(&[b"SET", b"key1", b"val1"]).unwrap();
+            wal.append_command(&[b"SET", b"key2", b"val2"]).unwrap();
+            wal.fsync().unwrap();
+        }
+
+        {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            assert!(wal.has_checksums);
+            let commands = wal.replay().unwrap();
+            assert_eq!(commands.len(), 2);
+            assert_eq!(commands[0][0], b"SET");
+            assert_eq!(commands[0][1], b"key1");
+            assert_eq!(commands[1][1], b"key2");
+        }
+    }
+
+    #[test]
+    fn wal_detects_corrupted_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            wal.append_command(&[b"SET", b"k1", b"v1"]).unwrap();
+            wal.append_command(&[b"SET", b"k2", b"v2"]).unwrap();
+            wal.fsync().unwrap();
+        }
+
+        // Corrupt the first frame's payload (after magic + frame_len + crc).
+        let wal_path = dir.path().join("shard_0/wal.lux");
+        let mut data = fs::read(&wal_path).unwrap();
+        // Flip a byte after magic(4) + frame_len(4) + crc(4) = offset 12.
+        if data.len() > 14 {
+            data[14] ^= 0xFF;
+        }
+        fs::write(&wal_path, &data).unwrap();
+
+        {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            let commands = wal.replay().unwrap();
+            // First frame corrupted, second should still be valid.
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0][1], b"k2");
+        }
+    }
+
+    #[test]
+    fn wal_truncate_preserves_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        wal.append_command(&[b"SET", b"x", b"y"]).unwrap();
+        wal.truncate().unwrap();
+        assert!(wal.has_checksums);
+
+        // After truncate, replay should return empty.
+        let commands = wal.replay().unwrap();
+        assert!(commands.is_empty());
+
+        // New appends should still be checksummed.
+        wal.append_command(&[b"SET", b"a", b"b"]).unwrap();
+        let commands = wal.replay().unwrap();
+        assert_eq!(commands.len(), 1);
+    }
+
+    #[test]
+    fn compact_upgrades_to_checksummed() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry1 = DumpEntry {
+            key: "k1".to_string(),
+            value: DumpValue::Str(b"v1".to_vec()),
+            ttl_ms: -1,
+        };
+        let entry2 = DumpEntry {
+            key: "k2".to_string(),
+            value: DumpValue::Str(b"v2".to_vec()),
+            ttl_ms: -1,
+        };
+
+        let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+        ds.put("k1", &entry1).unwrap();
+        ds.put("k2", &entry2).unwrap();
+        // Overwrite k1 to create dead bytes.
+        let entry1b = DumpEntry {
+            key: "k1".to_string(),
+            value: DumpValue::Str(b"v1_updated".to_vec()),
+            ttl_ms: -1,
+        };
+        ds.put("k1", &entry1b).unwrap();
+
+        assert!(ds.dead_bytes > 0);
+        ds.compact().unwrap();
+        assert!(ds.has_checksums);
+        assert_eq!(ds.dead_bytes, 0);
+        assert_eq!(ds.len(), 2);
+
+        // Verify data survived compaction.
+        let (val, _) = ds.get("k1", Instant::now()).unwrap().unwrap();
+        assert!(matches!(val, DumpValue::Str(ref v) if v == b"v1_updated"));
+        let (val, _) = ds.get("k2", Instant::now()).unwrap().unwrap();
+        assert!(matches!(val, DumpValue::Str(ref v) if v == b"v2"));
+    }
+
+    #[test]
+    fn wal_partial_frame_is_harmless() {
+        // Simulate a crash mid-write by appending partial bytes to the WAL.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            wal.append_command(&[b"SET", b"k1", b"v1"]).unwrap();
+            wal.fsync().unwrap();
+        }
+
+        // Append garbage (simulates partial frame from crash mid-write).
+        let wal_path = dir.path().join("shard_0/wal.lux");
+        let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        // Write a frame_len header but no actual payload.
+        file.write_all(&100u32.to_le_bytes()).unwrap();
+        file.write_all(b"partial").unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        // Replay should recover the valid command and skip the partial frame.
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+        let commands = wal.replay().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0][0], b"SET");
+        assert_eq!(commands[0][1], b"k1");
+    }
+
+    #[test]
+    fn disk_shard_partial_entry_is_harmless() {
+        // Simulate a crash mid-write by appending partial bytes to the data file.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+            let entry = DumpEntry {
+                key: "good".to_string(),
+                value: DumpValue::Str(b"data".to_vec()),
+                ttl_ms: -1,
+            };
+            ds.put("good", &entry).unwrap();
+        }
+
+        // Append garbage entry_len + partial data.
+        let data_path = dir.path().join("shard_0/data.lux");
+        let mut file = OpenOptions::new().append(true).open(&data_path).unwrap();
+        file.write_all(&50u32.to_le_bytes()).unwrap(); // entry_len = 50
+        file.write_all(b"not enough bytes").unwrap(); // only 16 bytes, not 50
+        file.flush().unwrap();
+        drop(file);
+
+        // Reopen: should recover the valid entry, skip the partial one.
+        let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+        assert_eq!(ds.len(), 1);
+        let (val, _) = ds.get("good", Instant::now()).unwrap().unwrap();
+        assert!(matches!(val, DumpValue::Str(ref v) if v == b"data"));
+    }
+
+    #[test]
+    fn disk_shard_survives_garbage_at_end() {
+        // Simulate the worst case: valid entries followed by partial garbage
+        // (what happens if a crash occurs mid-put before rollback runs).
+        // Verifies that rebuild_index recovers all valid entries.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+            for i in 0..5 {
+                let entry = DumpEntry {
+                    key: format!("k{i}"),
+                    value: DumpValue::Str(format!("v{i}").into_bytes()),
+                    ttl_ms: -1,
+                };
+                ds.put(&format!("k{i}"), &entry).unwrap();
+            }
+        }
+
+        // Append garbage that looks like a partial entry envelope.
+        let data_path = dir.path().join("shard_0/data.lux");
+        let mut file = OpenOptions::new().append(true).open(&data_path).unwrap();
+        // Write entry_len header claiming 200 bytes, but only write 5.
+        file.write_all(&200u32.to_le_bytes()).unwrap();
+        file.write_all(b"trash").unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        // Reopen: all 5 valid entries should survive.
+        let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+        assert_eq!(ds.len(), 5);
+        for i in 0..5 {
+            let (val, _) = ds.get(&format!("k{i}"), Instant::now()).unwrap().unwrap();
+            assert!(matches!(val, DumpValue::Str(ref v) if *v == format!("v{i}").into_bytes()));
+        }
+    }
+
+    #[test]
+    fn wal_append_is_atomic_single_buffer() {
+        // Verify that a WAL frame is written as a single contiguous block
+        // by checking that the file grows by exactly the expected frame size.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), 0).unwrap();
+
+        let wal_path = dir.path().join("shard_0/wal.lux");
+        let size_before = fs::metadata(&wal_path).unwrap().len();
+        assert_eq!(size_before, 4, "should only have magic header");
+
+        wal.append_command(&[b"SET", b"x", b"y"]).unwrap();
+        let size_after = fs::metadata(&wal_path).unwrap().len();
+
+        // Frame: 4B frame_len + 4B crc + 4B argc + (4B+3 "SET") + (4B+1 "x") + (4B+1 "y")
+        let payload_size: u64 = 4 + 7 + 5 + 5; // argc + 3 args
+        let frame_size = 4 + 4 + payload_size; // frame_len + crc + payload
+        assert_eq!(
+            size_after,
+            4 + frame_size,
+            "file should grow by exactly one frame"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Proptest: fuzz and property-based tests
+    // -----------------------------------------------------------------------
+    use proptest::prelude::*;
+
+    fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(any::<u8>(), 0..256)
+    }
+
+    fn arb_string() -> impl Strategy<Value = String> {
+        "[a-zA-Z0-9_]{0,64}"
+    }
+
+    fn arb_dump_value() -> impl Strategy<Value = DumpValue> {
+        prop_oneof![
+            arb_bytes().prop_map(DumpValue::Str),
+            prop::collection::vec(arb_bytes(), 0..16).prop_map(DumpValue::List),
+            prop::collection::vec((arb_string(), arb_bytes()), 0..16).prop_map(DumpValue::Hash),
+            prop::collection::vec(arb_string(), 0..16).prop_map(DumpValue::Set),
+            prop::collection::vec((arb_string(), (-1e10f64..1e10f64)), 0..16)
+                .prop_map(DumpValue::SortedSet),
+            (
+                prop::collection::vec(-1e6f32..1e6f32, 0..64),
+                prop::option::of(arb_string())
+            )
+                .prop_map(|(data, meta)| DumpValue::Vector(data, meta)),
+            prop::collection::vec(any::<u8>(), 0..256).prop_map(|regs| {
+                let cached = crate::hll::hll_count(&regs);
+                DumpValue::HyperLogLog(regs, cached)
+            }),
+            (
+                prop::collection::vec((any::<i64>(), (-1e10f64..1e10f64)), 0..16),
+                any::<u64>(),
+                prop::collection::vec((arb_string(), arb_string()), 0..8),
+            )
+                .prop_map(|(s, r, l)| DumpValue::TimeSeries(s, r, l)),
+            (
+                prop::collection::vec(
+                    (
+                        arb_string(),
+                        prop::collection::vec((arb_string(), arb_bytes()), 0..8),
+                    ),
+                    0..8,
+                ),
+                arb_string(),
+            )
+                .prop_map(|(entries, last_id)| DumpValue::Stream(entries, last_id)),
+        ]
+    }
+
+    fn arb_dump_entry() -> impl Strategy<Value = DumpEntry> {
+        (
+            arb_string(),
+            arb_dump_value(),
+            prop_oneof![Just(-1i64), 0i64..=3600000i64],
+        )
+            .prop_map(|(key, value, ttl_ms)| DumpEntry { key, value, ttl_ms })
+    }
+
+    fn values_match(a: &DumpValue, b: &DumpValue) -> bool {
+        match (a, b) {
+            (DumpValue::Str(a), DumpValue::Str(b)) => a == b,
+            (DumpValue::List(a), DumpValue::List(b)) => a == b,
+            (DumpValue::Hash(a), DumpValue::Hash(b)) => a == b,
+            (DumpValue::Set(a), DumpValue::Set(b)) => a == b,
+            (DumpValue::SortedSet(a), DumpValue::SortedSet(b)) => a == b,
+            (DumpValue::Stream(ae, al), DumpValue::Stream(be, bl)) => ae == be && al == bl,
+            (DumpValue::Vector(ad, am), DumpValue::Vector(bd, bm)) => ad == bd && am == bm,
+            (DumpValue::HyperLogLog(ar, _), DumpValue::HyperLogLog(br, _)) => ar == br,
+            (DumpValue::TimeSeries(as_, ar, al), DumpValue::TimeSeries(bs, br, bl)) => {
+                as_ == bs && ar == br && al == bl
+            }
+            _ => false,
+        }
+    }
+
+    // Fuzz: arbitrary bytes into read_single_entry should never panic.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn fuzz_read_single_entry_no_panic(data in prop::collection::vec(any::<u8>(), 0..1024)) {
+            let mut cursor = std::io::Cursor::new(&data);
+            let _ = read_single_entry(&mut cursor);
+        }
+    }
+
+    // Fuzz: arbitrary bytes appended to WAL should never panic on replay.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        #[test]
+        fn fuzz_wal_replay_no_panic(garbage in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let mut wal = Wal::open(dir.path(), 0).unwrap();
+                wal.append_command(&[b"SET", b"k", b"v"]).unwrap();
+                wal.fsync().unwrap();
+            }
+
+            let wal_path = dir.path().join("shard_0/wal.lux");
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .unwrap()
+                .write_all(&garbage)
+                .unwrap();
+
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            let commands = wal.replay().unwrap();
+            prop_assert!(!commands.is_empty(), "valid command should survive garbage");
+            prop_assert_eq!(&commands[0][0], b"SET");
+        }
+    }
+
+    // Fuzz: arbitrary bytes appended to data file should never panic on rebuild.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        #[test]
+        fn fuzz_disk_rebuild_no_panic(garbage in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+                let entry = DumpEntry {
+                    key: "valid".to_string(),
+                    value: DumpValue::Str(b"data".to_vec()),
+                    ttl_ms: -1,
+                };
+                ds.put("valid", &entry).unwrap();
+            }
+
+            let data_path = dir.path().join("shard_0/data.lux");
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&data_path)
+                .unwrap()
+                .write_all(&garbage)
+                .unwrap();
+
+            let ds = DiskShard::open(dir.path(), 0).unwrap();
+            prop_assert!(ds.len() >= 1, "valid entry should survive garbage append");
+        }
+    }
+
+    // Property: write_single_entry -> read_single_entry is lossless.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        #[test]
+        fn roundtrip_disk_entry(entry in arb_dump_entry()) {
+            let mut buf = Vec::new();
+            write_single_entry(&mut buf, &entry).unwrap();
+
+            let mut cursor = std::io::Cursor::new(&buf);
+            let (key, value, ttl_ms) = read_single_entry(&mut cursor).unwrap();
+
+            prop_assert_eq!(&key, &entry.key);
+            let expected_ttl = if entry.ttl_ms > 0 { entry.ttl_ms } else { -1 };
+            prop_assert_eq!(ttl_ms, expected_ttl);
+            prop_assert!(values_match(&entry.value, &value), "value mismatch");
+        }
+    }
+
+    // Property: WAL append -> replay round-trip preserves commands.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        #[test]
+        fn roundtrip_wal_commands(
+            commands in prop::collection::vec(
+                prop::collection::vec(arb_bytes(), 1..8),
+                1..20
+            )
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let mut wal = Wal::open(dir.path(), 0).unwrap();
+                for cmd in &commands {
+                    let refs: Vec<&[u8]> = cmd.iter().map(|a| a.as_slice()).collect();
+                    wal.append_command(&refs).unwrap();
+                }
+                wal.fsync().unwrap();
+            }
+
+            let mut wal = Wal::open(dir.path(), 0).unwrap();
+            let replayed = wal.replay().unwrap();
+
+            prop_assert_eq!(replayed.len(), commands.len());
+            for (original, recovered) in commands.iter().zip(replayed.iter()) {
+                prop_assert_eq!(original, recovered);
+            }
+        }
+    }
+
+    // Property: DiskShard put -> get round-trip preserves data.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        #[test]
+        fn roundtrip_disk_shard(entries in prop::collection::vec(arb_dump_entry(), 1..20)) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+
+            for entry in &entries {
+                ds.put(&entry.key, entry).unwrap();
+            }
+
+            let now = Instant::now();
+            let mut expected: std::collections::HashMap<String, &DumpEntry> =
+                std::collections::HashMap::new();
+            for entry in &entries {
+                expected.insert(entry.key.clone(), entry);
+            }
+
+            for (key, entry) in &expected {
+                let result = ds.get(key, now).unwrap();
+                match result {
+                    Some((value, _ttl)) => {
+                        prop_assert!(
+                            values_match(&entry.value, &value),
+                            "value mismatch for key '{}'",
+                            key
+                        );
+                    }
+                    None => {
+                        prop_assert_eq!(
+                            entry.ttl_ms, 0,
+                            "non-expired key '{}' missing from disk",
+                            key
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Property: DiskShard survives reopen with arbitrary entries.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(100))]
+
+        #[test]
+        fn disk_shard_reopen_roundtrip(entries in prop::collection::vec(arb_dump_entry(), 1..10)) {
+            let dir = tempfile::tempdir().unwrap();
+            {
+                let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+                for entry in &entries {
+                    ds.put(&entry.key, entry).unwrap();
+                }
+            }
+
+            let mut ds = DiskShard::open(dir.path(), 0).unwrap();
+
+            let mut expected: std::collections::HashMap<String, &DumpEntry> =
+                std::collections::HashMap::new();
+            for entry in &entries {
+                expected.insert(entry.key.clone(), entry);
+            }
+
+            let now = Instant::now();
+            for (key, entry) in &expected {
+                if entry.ttl_ms > 0 {
+                    let result = ds.get(key, now).unwrap();
+                    if let Some((value, _)) = result {
+                        prop_assert!(
+                            values_match(&entry.value, &value),
+                            "reopen: value mismatch for key '{}'",
+                            key
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

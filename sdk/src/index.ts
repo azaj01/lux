@@ -197,16 +197,12 @@ export class Lux extends Redis {
 
 		const rows: TableRow[] = [];
 		for (const item of result) {
-			if (Array.isArray(item) && item.length >= 2) {
-				const row: TableRow = { id: 0 };
-				for (let i = 0; i < item.length - 1; i += 2) {
+			if (Array.isArray(item) && item.length >= 1) {
+				const row: TableRow = { id: parseInt(item[0], 10) };
+				for (let i = 1; i < item.length - 1; i += 2) {
 					const key = String(item[i]);
 					const val = item[i + 1];
-					if (key === 'id') {
-						row.id = parseInt(val, 10);
-					} else {
-						row[key] = val;
-					}
+					row[key] = val;
 				}
 				rows.push(row);
 			}

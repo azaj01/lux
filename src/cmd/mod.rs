@@ -23,6 +23,7 @@ use std::time::Instant;
 use crate::pubsub::Broker;
 use crate::resp;
 use crate::store::{Entry, Store, StoreValue};
+use crate::tables::SharedSchemaCache;
 
 pub enum CmdResult {
     Written,
@@ -112,6 +113,7 @@ fn format_float(v: f64) -> String {
 
 pub fn execute(
     store: &Store,
+    cache: &SharedSchemaCache,
     _broker: &Broker,
     args: &[&[u8]],
     out: &mut BytesMut,
@@ -645,37 +647,40 @@ pub fn execute(
                 return timeseries::cmd_tsinfo(args, store, out, now);
             }
             if cmd_eq(cmd, b"TCREATE") {
-                return tables::cmd_tcreate(args, store, out, now);
+                return tables::cmd_tcreate(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TINSERT") {
-                return tables::cmd_tinsert(args, store, out, now);
+                return tables::cmd_tinsert(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TGET") {
-                return tables::cmd_tget(args, store, out, now);
+                return tables::cmd_tget(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TQUERY") {
-                return tables::cmd_tquery(args, store, out, now);
+                return tables::cmd_tquery(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TUPDATE") {
-                return tables::cmd_tupdate(args, store, out, now);
+                return tables::cmd_tupdate(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TDEL") {
-                return tables::cmd_tdel(args, store, out, now);
+                return tables::cmd_tdel(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TDROP") {
-                return tables::cmd_tdrop(args, store, out, now);
+                return tables::cmd_tdrop(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TCOUNT") {
-                return tables::cmd_tcount(args, store, out, now);
+                return tables::cmd_tcount(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TSCHEMA") {
-                return tables::cmd_tschema(args, store, out, now);
+                return tables::cmd_tschema(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TALTER") {
-                return tables::cmd_talter(args, store, out, now);
+                return tables::cmd_talter(args, store, cache, out, now);
             }
             if cmd_eq(cmd, b"TLIST") {
                 return tables::cmd_tlist(args, store, out, now);
+            }
+            if cmd_eq(cmd, b"TSELECT") {
+                return tables::cmd_tselect(args, store, cache, out, now);
             }
         }
         b'U' => {
@@ -843,6 +848,7 @@ pub fn execute(
 
 pub fn execute_with_wal(
     store: &Store,
+    cache: &SharedSchemaCache,
     broker: &Broker,
     args: &[&[u8]],
     out: &mut BytesMut,
@@ -851,7 +857,7 @@ pub fn execute_with_wal(
     if !args.is_empty() && crate::eviction::is_write_command(args[0]) {
         store.wal_log_command(args);
     }
-    execute(store, broker, args, out, now)
+    execute(store, cache, broker, args, out, now)
 }
 
 pub type ShardData = hashbrown::HashMap<String, Entry, crate::store::FxBuildHasher>;
@@ -1950,9 +1956,11 @@ mod tests {
 
     fn exec(store: &Store, args: &[&[u8]]) -> BytesMut {
         let broker = Broker::new();
+        let cache =
+            std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
         let mut out = BytesMut::new();
         let now = Instant::now();
-        execute(store, &broker, args, &mut out, now);
+        execute(store, &cache, &broker, args, &mut out, now);
         out
     }
 

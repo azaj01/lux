@@ -215,7 +215,7 @@ fn http_exec_tables() {
     let resp = post(
         17611,
         "/v1/exec",
-        r#"{"command":["TCREATE","users","name:str","age:int"]}"#,
+        r#"{"command":["TCREATE","users","name","STR,","age","INT"]}"#,
         "",
     );
     assert!(resp.contains("\"OK\""), "tcreate: {resp}");
@@ -289,7 +289,7 @@ fn http_tables_rest() {
     let resp = post(
         17621,
         "/v1/tables",
-        r#"{"name":"users","columns":["name:str","age:int"]}"#,
+        r#"{"name":"users","columns":["name STR","age INT"]}"#,
         "",
     );
     assert!(resp.contains("\"OK\""), "create table: {resp}");

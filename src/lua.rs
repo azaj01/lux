@@ -286,7 +286,16 @@ pub fn eval(
             }
             let refs: Vec<&[u8]> = cmd_args.iter().map(|v| v.as_slice()).collect();
             let mut out = BytesMut::new();
-            crate::cmd::execute(&store_clone, &broker_clone, &refs, &mut out, now);
+            let lua_cache =
+                std::sync::Arc::new(parking_lot::RwLock::new(crate::tables::SchemaCache::new()));
+            crate::cmd::execute(
+                &store_clone,
+                &lua_cache,
+                &broker_clone,
+                &refs,
+                &mut out,
+                now,
+            );
             resp_to_lua(lua_ctx, &out).map_err(|e| mlua::Error::external(format!("{}", e)))
         })
         .map_err(|e| format!("ERR lua error: {}", e))?;

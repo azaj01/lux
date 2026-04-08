@@ -585,7 +585,10 @@ impl Store {
                         let refs: Vec<&[u8]> = cmd_args.iter().map(|a| a.as_slice()).collect();
                         let mut out = bytes::BytesMut::new();
                         let now = Instant::now();
-                        crate::cmd::execute(self, broker, &refs, &mut out, now);
+                        let wal_cache = std::sync::Arc::new(parking_lot::RwLock::new(
+                            crate::tables::SchemaCache::new(),
+                        ));
+                        crate::cmd::execute(self, &wal_cache, broker, &refs, &mut out, now);
                         total += 1;
                     }
                 }

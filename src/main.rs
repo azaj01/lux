@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 use store::Store;
+use tables::SharedSchemaCache;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -42,6 +43,9 @@ async fn main() -> std::io::Result<()> {
     let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr).await?;
     let store = Arc::new(Store::new());
+    let schema_cache: SharedSchemaCache = std::sync::Arc::new(parking_lot::RwLock::new(
+        tables::SchemaCache::new(),
+    ));
     if disk::storage_config().mode == disk::StorageMode::Tiered {
         println!("storage: tiered mode (dir: {})", disk::storage_config().dir);
     }
@@ -109,8 +113,9 @@ async fn main() -> std::io::Result<()> {
         if http_port > 0 {
             let http_store = store.clone();
             let http_broker = broker.clone();
+            let http_cache = schema_cache.clone();
             tokio::spawn(async move {
-                if let Err(e) = http::start_http_server(http_port, http_store, http_broker).await {
+                if let Err(e) = http::start_http_server(http_port, http_store, http_broker, http_cache).await {
                     eprintln!("http server error: {e}");
                 }
             });
@@ -119,17 +124,31 @@ async fn main() -> std::io::Result<()> {
 
     println!("lux v{} ready on {addr}", env!("CARGO_PKG_VERSION"));
 
+    if port == 0 {
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
+
     loop {
         let (socket, peer) = listener.accept().await?;
         let store = store.clone();
         let broker = broker.clone();
         let script_engine = script_engine.clone();
+        let schema_cache = schema_cache.clone();
         socket.set_nodelay(true).ok();
 
         tokio::spawn(async move {
             CONNECTED_CLIENTS.fetch_add(1, Ordering::Relaxed);
-            let result =
-                handle_connection(socket, peer, store, broker, require_auth, script_engine).await;
+            let result = handle_connection(
+                socket,
+                peer,
+                store,
+                broker,
+                require_auth,
+                script_engine,
+                schema_cache,
+            )
+            .await;
             CONNECTED_CLIENTS.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = result {
                 if e.kind() != std::io::ErrorKind::ConnectionReset {
@@ -204,6 +223,7 @@ async fn handle_tx_cmd(
     authenticated: &mut bool,
     store: &Arc<Store>,
     broker: &Broker,
+    schema_cache: &SharedSchemaCache,
     write_buf: &mut BytesMut,
     now: Instant,
 ) -> bool {
@@ -251,7 +271,7 @@ async fn handle_tx_cmd(
                     let refs: Vec<&[u8]> = owned_args.iter().map(|v| v.as_slice()).collect();
                     let cmd_result = {
                         let _guard = SCRIPT_GATE.read();
-                        cmd::execute_with_wal(store, broker, &refs, write_buf, now)
+                        cmd::execute_with_wal(store, &schema_cache, broker, &refs, write_buf, now)
                     };
                     match cmd_result {
                         CmdResult::Written => {}
@@ -402,6 +422,7 @@ async fn handle_connection(
     broker: Broker,
     require_auth: bool,
     script_engine: Arc<lua::ScriptEngine>,
+    schema_cache: SharedSchemaCache,
 ) -> std::io::Result<()> {
     let mut read_buf = vec![0u8; 65536];
     let mut write_buf = BytesMut::with_capacity(65536);
@@ -645,6 +666,7 @@ async fn handle_connection(
                         &mut authenticated,
                         &store,
                         &broker,
+                        &schema_cache,
                         &mut write_buf,
                         now,
                     )
@@ -655,7 +677,7 @@ async fn handle_connection(
 
                     let cmd_result = {
                         let _guard = SCRIPT_GATE.read();
-                        cmd::execute_with_wal(&store, &broker, args, &mut write_buf, now)
+                        cmd::execute_with_wal(&store, &schema_cache, &broker, args, &mut write_buf, now)
                     };
                     match cmd_result {
                         CmdResult::Written => {
@@ -836,6 +858,7 @@ async fn handle_connection(
                             &mut authenticated,
                             &store,
                             &broker,
+                            &schema_cache,
                             &mut write_buf,
                             now,
                         )
@@ -846,7 +869,7 @@ async fn handle_connection(
 
                         let cmd_result = {
                             let _guard = SCRIPT_GATE.read();
-                            cmd::execute_with_wal(&store, &broker, args, &mut write_buf, now)
+                            cmd::execute_with_wal(&store, &schema_cache, &broker, args, &mut write_buf, now)
                         };
                         match cmd_result {
                             CmdResult::Written => {
@@ -1063,7 +1086,7 @@ async fn handle_connection(
                             }
                         } else {
                             for args in &commands[i..batch_end] {
-                                cmd::execute_with_wal(&store, &broker, args, &mut write_buf, now);
+                                cmd::execute_with_wal(&store, &schema_cache, &broker, args, &mut write_buf, now);
                                 fire_key_events(&broker, args);
                             }
                         }

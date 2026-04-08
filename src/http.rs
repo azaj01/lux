@@ -7,6 +7,7 @@ use tokio::net::TcpSocket;
 use crate::cmd;
 use crate::pubsub::Broker;
 use crate::store::Store;
+use crate::tables::SharedSchemaCache;
 
 /// Constant-time byte comparison to prevent timing attacks on auth tokens.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -28,6 +29,7 @@ pub async fn start_http_server(
     port: u16,
     store: Arc<Store>,
     broker: Broker,
+    cache: SharedSchemaCache,
 ) -> std::io::Result<()> {
     let addr: std::net::SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
     let socket = TcpSocket::new_v4()?;
@@ -37,12 +39,14 @@ pub async fn start_http_server(
     println!("lux http api ready on 0.0.0.0:{port}");
 
     loop {
-        let (mut socket, _) = listener.accept().await?;
+        let (socket, _) = listener.accept().await?;
         let store = store.clone();
         let broker = broker.clone();
+        let cache = cache.clone();
 
         tokio::spawn(async move {
-            while let Ok(true) = handle_request(&mut socket, &store, &broker).await {}
+            let mut stream = socket;
+            while let Ok(true) = handle_request(&mut stream, &store, &broker, &cache).await {}
         });
     }
 }
@@ -51,6 +55,7 @@ async fn handle_request(
     socket: &mut tokio::net::TcpStream,
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> std::io::Result<bool> {
     let mut buf = vec![0u8; 65536];
     let mut data = Vec::new();
@@ -122,10 +127,187 @@ async fn handle_request(
     };
     let params = parse_query_string(&query_string);
 
+    // Fast path: table GET queries stream JSON directly without building
+    // the full response string in memory first.
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if method == "GET" {
+        match segments.as_slice() {
+            ["v1", "tables", table] => {
+                return stream_table_query(socket, table, &params, store, cache).await;
+            }
+            ["v1", "tables", table, "count"] => {
+                let now = std::time::Instant::now();
+                let body = match crate::tables::table_count(store, cache, table, now) {
+                    Ok(n) => format!(r#"{{"result":{n}}}"#),
+                    Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                };
+                return send_json(socket, 200, "OK", &body).await;
+            }
+            ["v1", "tables", table, "schema"] => {
+                let now = std::time::Instant::now();
+                let body = match crate::tables::table_schema(store, cache, table, now) {
+                    Ok(fields) => {
+                        let items: Vec<String> = fields.iter()
+                            .map(|f| format!(r#""{}""#, escape_json(f)))
+                            .collect();
+                        format!(r#"{{"result":[{}]}}"#, items.join(","))
+                    }
+                    Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                };
+                return send_json(socket, 200, "OK", &body).await;
+            }
+            ["v1", "tables", table, id] if *id != "count" && *id != "schema" => {
+                let now = std::time::Instant::now();
+                let body = match id.parse::<i64>() {
+                    Ok(id_i64) => match crate::tables::table_get(store, cache, table, id_i64, now) {
+                        Ok(row) => row_to_json_object(&row),
+                        Err(e) => format!(r#"{{"error":"{}"}}"#, escape_json(&e)),
+                    },
+                    Err(_) => r#"{"error":"invalid row id"}"#.to_string(),
+                };
+                return send_json(socket, 200, "OK", &body).await;
+            }
+            _ => {}
+        }
+    }
+
     let (status, status_text, result) =
-        route_request(&method, &path, &body, &params, store, broker);
+        route_request(&method, &path, &body, &params, store, broker, cache);
 
     send_json(socket, status, status_text, &result).await
+}
+
+/// Stream a table query response using chunked transfer encoding.
+/// Writes rows directly to the socket as they come out of table_select,
+/// without ever building the full JSON string in memory.
+async fn stream_table_query(
+    socket: &mut tokio::net::TcpStream,
+    table: &str,
+    params: &[(String, String)],
+    store: &Arc<Store>,
+    cache: &SharedSchemaCache,
+) -> std::io::Result<bool> {
+    use tokio::io::AsyncWriteExt;
+
+    let now = std::time::Instant::now();
+
+    // Build select tokens from params
+    let mut tokens: Vec<String> = vec!["*".to_string(), "FROM".to_string(), table.to_string()];
+    if let Some(w) = get_param(params, "where") {
+        tokens.push("WHERE".to_string());
+        for p in w.split_whitespace() { tokens.push(p.to_string()); }
+    }
+    if let Some(j) = get_param(params, "join") {
+        tokens.push("JOIN".to_string());
+        tokens.push(j.to_string());
+    }
+    if let Some(o) = get_param(params, "order") {
+        tokens.push("ORDER".to_string());
+        tokens.push("BY".to_string());
+        for p in o.split_whitespace() { tokens.push(p.to_string()); }
+    }
+    if let Some(l) = get_param(params, "limit") {
+        tokens.push("LIMIT".to_string());
+        tokens.push(l.to_string());
+    }
+    if let Some(o) = get_param(params, "offset") {
+        tokens.push("OFFSET".to_string());
+        tokens.push(o.to_string());
+    }
+
+    let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+
+    let result = match crate::tables::parse_select(&refs) {
+        Ok(plan) => crate::tables::table_select(store, cache, &plan, now),
+        Err(e) => {
+            let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
+            return send_json(socket, 400, "Bad Request", &body).await;
+        }
+    };
+
+    match result {
+        Err(e) => {
+            let body = format!(r#"{{"error":"{}"}}"#, escape_json(&e));
+            return send_json(socket, 400, "Bad Request", &body).await;
+        }
+        Ok(crate::tables::SelectResult::Aggregate(row)) => {
+            // Aggregates are always small - no need to stream
+            let body = {
+                let mut out = String::with_capacity(128);
+                out.push_str(r#"{"result":{"#);
+                let mut first = true;
+                for (k, v) in &row {
+                    if !first { out.push(','); }
+                    first = false;
+                    out.push('"');
+                    push_escaped(&mut out, k);
+                    out.push_str(r#"":"#);
+                    if looks_numeric(v) { out.push_str(v); }
+                    else { out.push('"'); push_escaped(&mut out, v); out.push('"'); }
+                }
+                out.push_str("}}");
+                out
+            };
+            return send_json(socket, 200, "OK", &body).await;
+        }
+        Ok(crate::tables::SelectResult::Rows(rows)) => {
+            // Stream rows using chunked transfer encoding, batching rows into
+            // ~64KB chunks to minimise syscall overhead.
+            const CHUNK_SIZE: usize = 65536;
+
+            let header = "HTTP/1.1 200 OK\r\n\
+                Content-Type: application/json\r\n\
+                Transfer-Encoding: chunked\r\n\
+                Access-Control-Allow-Origin: *\r\n\r\n";
+            socket.write_all(header.as_bytes()).await?;
+
+            let mut buf = String::with_capacity(CHUNK_SIZE + 4096);
+            buf.push_str(r#"{"result":["#);
+
+            let mut first_row = true;
+            for row in &rows {
+                if !first_row { buf.push(','); }
+                first_row = false;
+                buf.push('{');
+                let mut first_col = true;
+                for (k, v) in row {
+                    if !first_col { buf.push(','); }
+                    first_col = false;
+                    buf.push('"');
+                    push_escaped(&mut buf, k);
+                    buf.push_str(r#"":"#);
+                    if looks_numeric(v) { buf.push_str(v); }
+                    else if v == "true" || v == "false" { buf.push_str(v); }
+                    else { buf.push('"'); push_escaped(&mut buf, v); buf.push('"'); }
+                }
+                buf.push('}');
+
+                // Flush once we hit the chunk threshold
+                if buf.len() >= CHUNK_SIZE {
+                    write_chunk(socket, buf.as_bytes()).await?;
+                    buf.clear();
+                }
+            }
+
+            // Flush remainder + close
+            buf.push_str("]}");
+            write_chunk(socket, buf.as_bytes()).await?;
+            socket.write_all(b"0\r\n\r\n").await?;
+        }
+    }
+
+    Ok(true)
+}
+
+/// Write a single HTTP chunk: `{hex_len}\r\n{data}\r\n`
+async fn write_chunk(socket: &mut tokio::net::TcpStream, data: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if data.is_empty() { return Ok(()); }
+    let header = format!("{:x}\r\n", data.len());
+    socket.write_all(header.as_bytes()).await?;
+    socket.write_all(data).await?;
+    socket.write_all(b"\r\n").await?;
+    Ok(())
 }
 
 async fn send_json(
@@ -223,6 +405,7 @@ fn route_request(
     params: &[(String, String)],
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let path = path.trim_start_matches('/');
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -243,10 +426,10 @@ fn route_request(
 
     match (method, base) {
         // ── exec (escape hatch) ──
-        ("POST", ["exec"]) => ok(handle_exec(body, store, broker)),
+        ("POST", ["exec"]) => ok(handle_exec(body, store, broker, cache)),
 
         // ── KV routes ──
-        ("GET", ["kv", key]) => ok(exec_simple(store, broker, &["GET", key])),
+        ("GET", ["kv", key]) => ok(exec_simple(store, broker, cache, &["GET", key])),
         ("PUT", ["kv", key]) => {
             let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
             let value = parsed["value"].as_str().unwrap_or("");
@@ -254,49 +437,78 @@ fn route_request(
                 ok(exec_simple(
                     store,
                     broker,
+                    cache,
                     &["SET", key, value, "EX", &ex.to_string()],
                 ))
             } else {
-                ok(exec_simple(store, broker, &["SET", key, value]))
+                ok(exec_simple(store, broker, cache, &["SET", key, value]))
             }
         }
-        ("DELETE", ["kv", key]) => ok(exec_simple(store, broker, &["DEL", key])),
-        ("POST", ["kv", key, "incr"]) => ok(exec_simple(store, broker, &["INCR", key])),
-        ("POST", ["kv", key, "decr"]) => ok(exec_simple(store, broker, &["DECR", key])),
-        ("GET", ["kv", key, "hash"]) => ok(exec_simple(store, broker, &["HGETALL", key])),
+        ("DELETE", ["kv", key]) => ok(exec_simple(store, broker, cache, &["DEL", key])),
+        ("POST", ["kv", key, "incr"]) => ok(exec_simple(store, broker, cache, &["INCR", key])),
+        ("POST", ["kv", key, "decr"]) => ok(exec_simple(store, broker, cache, &["DECR", key])),
+        ("GET", ["kv", key, "hash"]) => ok(exec_simple(store, broker, cache, &["HGETALL", key])),
         ("GET", ["kv", key, "list"]) => {
             let start = get_param(params, "start").unwrap_or("0");
             let stop = get_param(params, "stop").unwrap_or("-1");
-            ok(exec_simple(store, broker, &["LRANGE", key, start, stop]))
+            ok(exec_simple(store, broker, cache, &["LRANGE", key, start, stop]))
         }
-        ("GET", ["kv", key, "set"]) => ok(exec_simple(store, broker, &["SMEMBERS", key])),
+        ("GET", ["kv", key, "set"]) => ok(exec_simple(store, broker, cache, &["SMEMBERS", key])),
         ("GET", ["kv", key, "zset"]) => {
             let min = get_param(params, "min").unwrap_or("-inf");
             let max = get_param(params, "max").unwrap_or("+inf");
             ok(exec_simple(
                 store,
                 broker,
+                cache,
                 &["ZRANGEBYSCORE", key, min, max, "WITHSCORES"],
             ))
         }
         ("GET", ["keys"]) => {
             let pattern = get_param(params, "pattern").unwrap_or("*");
-            ok(exec_simple(store, broker, &["KEYS", pattern]))
+            ok(exec_simple(store, broker, cache, &["KEYS", pattern]))
         }
-        ("GET", ["dbsize"]) => ok(exec_simple(store, broker, &["DBSIZE"])),
-        ("GET", ["ping"]) => ok(exec_simple(store, broker, &["PING"])),
+        ("GET", ["dbsize"]) => ok(exec_simple(store, broker, cache, &["DBSIZE"])),
+        ("GET", ["ping"]) => ok(exec_simple(store, broker, cache, &["PING"])),
 
         // ── Table routes (PostgREST-style) ──
-        ("GET", ["tables"]) => ok(exec_simple(store, broker, &["TLIST"])),
-        ("POST", ["tables"]) => route_table_create(body, store, broker),
-        ("GET", ["tables", table]) => route_table_query(table, params, store, broker),
-        ("GET", ["tables", table, "schema"]) => ok(exec_simple(store, broker, &["TSCHEMA", table])),
-        ("GET", ["tables", table, "count"]) => ok(exec_simple(store, broker, &["TCOUNT", table])),
-        ("GET", ["tables", table, id]) => ok(exec_simple(store, broker, &["TGET", table, id])),
-        ("POST", ["tables", table]) => route_table_insert(table, body, store, broker),
-        ("PUT", ["tables", table, id]) => route_table_update(table, id, body, store, broker),
-        ("DELETE", ["tables", table, id]) => ok(exec_simple(store, broker, &["TDEL", table, id])),
-        ("DELETE", ["tables", table]) => ok(exec_simple(store, broker, &["TDROP", table])),
+        ("GET", ["tables"]) => ok(exec_simple(store, broker, cache, &["TLIST"])),
+        ("POST", ["tables"]) => route_table_create(body, store, broker, cache),
+        ("GET", ["tables", table]) => route_table_query(table, params, store, broker, cache),
+        ("GET", ["tables", table, "schema"]) => {
+            let now = std::time::Instant::now();
+            match crate::tables::table_schema(store, cache, table, now) {
+                Ok(fields) => {
+                    let items: Vec<String> = fields.iter()
+                        .map(|f| format!(r#""{}""#, escape_json(f)))
+                        .collect();
+                    ok(format!(r#"{{"result":[{}]}}"#, items.join(",")))
+                }
+                Err(e) => (400, "Bad Request", format!(r#"{{"error":"{}"}}"#, escape_json(&e))),
+            }
+        }
+        ("GET", ["tables", table, "count"]) => {
+            let now = std::time::Instant::now();
+            match crate::tables::table_count(store, cache, table, now) {
+                Ok(n) => ok(format!(r#"{{"result":{n}}}"#)),
+                Err(e) => (400, "Bad Request", format!(r#"{{"error":"{}"}}"#, escape_json(&e))),
+            }
+        }
+        ("GET", ["tables", table, id]) => {
+            let now = std::time::Instant::now();
+            let id_i64: i64 = match id.parse() {
+                Ok(v) => v,
+                Err(_) => return (400, "Bad Request", r#"{"error":"invalid row id"}"#.to_string()),
+            };
+            match crate::tables::table_get(store, cache, table, id_i64, now) {
+                Ok(row) => ok(row_to_json_object(&row)),
+                Err(e) => (404, "Not Found", format!(r#"{{"error":"{}"}}"#, escape_json(&e))),
+            }
+        }
+        ("POST", ["tables", table]) => route_table_insert(table, body, store, broker, cache),
+        ("PUT", ["tables", table, id]) => route_table_update(table, id, body, store, broker, cache),
+        ("DELETE", ["tables", table, id]) => ok(exec_simple(store, broker, cache, &["TDEL", table, id])),
+        ("DELETE", ["tables", table]) => ok(exec_simple(store, broker, cache, &["TDROP", table])),
 
         // ── Time Series routes ──
         ("GET", ["ts"]) => {
@@ -316,23 +528,23 @@ fn route_request(
                         args.push(bucket);
                     }
                 }
-                ok(exec_simple(store, broker, &args))
+                ok(exec_simple(store, broker, cache, &args))
             }
         }
-        ("GET", ["ts", key]) => route_ts_range(key, params, store, broker),
-        ("POST", ["ts", key]) => route_ts_add(key, body, store, broker),
-        ("GET", ["ts", key, "info"]) => ok(exec_simple(store, broker, &["TSINFO", key])),
-        ("GET", ["ts", key, "latest"]) => ok(exec_simple(store, broker, &["TSGET", key])),
+        ("GET", ["ts", key]) => route_ts_range(key, params, store, broker, cache),
+        ("POST", ["ts", key]) => route_ts_add(key, body, store, broker, cache),
+        ("GET", ["ts", key, "info"]) => ok(exec_simple(store, broker, cache, &["TSINFO", key])),
+        ("GET", ["ts", key, "latest"]) => ok(exec_simple(store, broker, cache, &["TSGET", key])),
 
         // ── Vector routes ──
-        ("POST", ["vectors", "search"]) => route_vector_search(body, store, broker),
-        ("POST", ["vectors", key]) => route_vector_set(key, body, store, broker),
-        ("GET", ["vectors", key]) => ok(exec_simple(store, broker, &["VGET", key])),
-        ("DELETE", ["vectors", key]) => ok(exec_simple(store, broker, &["DEL", key])),
-        ("GET", ["vectors"]) => ok(exec_simple(store, broker, &["VCARD"])),
+        ("POST", ["vectors", "search"]) => route_vector_search(body, store, broker, cache),
+        ("POST", ["vectors", key]) => route_vector_set(key, body, store, broker, cache),
+        ("GET", ["vectors", key]) => ok(exec_simple(store, broker, cache, &["VGET", key])),
+        ("DELETE", ["vectors", key]) => ok(exec_simple(store, broker, cache, &["DEL", key])),
+        ("GET", ["vectors"]) => ok(exec_simple(store, broker, cache, &["VCARD"])),
 
         // ── Legacy flat routes (backwards compat) ──
-        ("GET", ["get", key]) => ok(exec_simple(store, broker, &["GET", key])),
+        ("GET", ["get", key]) => ok(exec_simple(store, broker, cache, &["GET", key])),
         ("POST", ["set", key]) => {
             let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
             let value = parsed["value"].as_str().unwrap_or("");
@@ -340,17 +552,18 @@ fn route_request(
                 ok(exec_simple(
                     store,
                     broker,
+                    cache,
                     &["SET", key, value, "EX", &ex.to_string()],
                 ))
             } else {
-                ok(exec_simple(store, broker, &["SET", key, value]))
+                ok(exec_simple(store, broker, cache, &["SET", key, value]))
             }
         }
-        ("POST", ["del", key]) => ok(exec_simple(store, broker, &["DEL", key])),
-        ("POST", ["incr", key]) => ok(exec_simple(store, broker, &["INCR", key])),
-        ("POST", ["decr", key]) => ok(exec_simple(store, broker, &["DECR", key])),
-        ("GET", ["hgetall", key]) => ok(exec_simple(store, broker, &["HGETALL", key])),
-        ("GET", ["keys", pattern]) => ok(exec_simple(store, broker, &["KEYS", pattern])),
+        ("POST", ["del", key]) => ok(exec_simple(store, broker, cache, &["DEL", key])),
+        ("POST", ["incr", key]) => ok(exec_simple(store, broker, cache, &["INCR", key])),
+        ("POST", ["decr", key]) => ok(exec_simple(store, broker, cache, &["DECR", key])),
+        ("GET", ["hgetall", key]) => ok(exec_simple(store, broker, cache, &["HGETALL", key])),
+        ("GET", ["keys", pattern]) => ok(exec_simple(store, broker, cache, &["KEYS", pattern])),
 
         _ => (404, "Not Found", r#"{"error":"not found"}"#.to_string()),
     }
@@ -366,6 +579,7 @@ fn route_table_create(
     body: &str,
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -400,66 +614,99 @@ fn route_table_create(
         }
     };
 
-    let mut args: Vec<String> = vec!["TCREATE".to_string(), name.to_string()];
+    // Build the column list as SQL-like specs joined by commas.
+    // Accepts two formats per element:
+    //   - plain string: "id UUID PRIMARY KEY" (passed through as-is)
+    //   - object: {"name":"email","type":"STR","primaryKey":true,"unique":true,"notNull":true,
+    //              "references":"users(id)","onDelete":"CASCADE"}
+    let mut col_specs: Vec<String> = Vec::new();
     for col in columns {
         if let Some(s) = col.as_str() {
-            args.push(s.to_string());
+            col_specs.push(s.to_string());
         } else if let Some(obj) = col.as_object() {
             let col_name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let col_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("str");
-            let unique = obj.get("unique").and_then(|v| v.as_bool()).unwrap_or(false);
-            if unique {
-                args.push(format!("{col_name}:{col_type}:unique"));
-            } else {
-                args.push(format!("{col_name}:{col_type}"));
+            let col_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("STR");
+            let mut spec = format!("{} {}", col_name, col_type);
+            if obj.get("primaryKey").and_then(|v| v.as_bool()).unwrap_or(false) {
+                spec.push_str(" PRIMARY KEY");
+            } else if obj.get("unique").and_then(|v| v.as_bool()).unwrap_or(false) {
+                spec.push_str(" UNIQUE");
             }
+            if obj.get("notNull").and_then(|v| v.as_bool()).unwrap_or(false) {
+                spec.push_str(" NOT NULL");
+            }
+            if let Some(refs) = obj.get("references").and_then(|v| v.as_str()) {
+                spec.push_str(&format!(" REFERENCES {}", refs));
+                if let Some(on_delete) = obj.get("onDelete").and_then(|v| v.as_str()) {
+                    spec.push_str(&format!(" ON DELETE {}", on_delete));
+                }
+            }
+            col_specs.push(spec);
         }
     }
 
+    // Join with commas and split back into tokens for parse_column_list
+    let combined = col_specs.join(", ");
+    let mut args: Vec<String> = vec!["TCREATE".to_string(), name.to_string()];
+    args.extend(combined.split_whitespace().map(|s| s.to_string()));
+
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, &refs))
+    ok(exec_simple(store, broker, cache, &refs))
 }
 
 fn route_table_query(
     table: &str,
     params: &[(String, String)],
     store: &Arc<Store>,
-    broker: &Broker,
+    _broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
-    let mut args: Vec<String> = vec!["TQUERY".to_string(), table.to_string()];
+    let now = std::time::Instant::now();
+
+    // Build a TSELECT plan directly from query params - no RESP round-trip
+    let mut select_tokens: Vec<String> = vec!["*".to_string(), "FROM".to_string(), table.to_string()];
 
     if let Some(where_clause) = get_param(params, "where") {
-        args.push("WHERE".to_string());
+        select_tokens.push("WHERE".to_string());
         for part in where_clause.split_whitespace() {
-            args.push(part.to_string());
+            select_tokens.push(part.to_string());
         }
     }
 
     if let Some(join) = get_param(params, "join") {
-        args.push("JOIN".to_string());
-        args.push(join.to_string());
+        // Legacy single-field join shorthand: join=field_name
+        // Translate to TSELECT JOIN syntax using the FK field
+        select_tokens.push("JOIN".to_string());
+        select_tokens.push(join.to_string());
     }
 
     if let Some(order) = get_param(params, "order") {
-        args.push("ORDER".to_string());
-        args.push("BY".to_string());
+        select_tokens.push("ORDER".to_string());
+        select_tokens.push("BY".to_string());
         for part in order.split_whitespace() {
-            args.push(part.to_string());
+            select_tokens.push(part.to_string());
         }
     }
 
     if let Some(limit) = get_param(params, "limit") {
-        args.push("LIMIT".to_string());
-        args.push(limit.to_string());
+        select_tokens.push("LIMIT".to_string());
+        select_tokens.push(limit.to_string());
     }
 
     if let Some(offset) = get_param(params, "offset") {
-        args.push("OFFSET".to_string());
-        args.push(offset.to_string());
+        select_tokens.push("OFFSET".to_string());
+        select_tokens.push(offset.to_string());
     }
 
-    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, &refs))
+    let refs: Vec<&str> = select_tokens.iter().map(|s| s.as_str()).collect();
+
+    match crate::tables::parse_select(&refs) {
+        Ok(plan) => match crate::tables::table_select(store, cache, &plan, now) {
+            Ok(result) => ok(select_result_to_json(result)),
+            Err(e) => (400, "Bad Request", format!(r#"{{"error":"{}"}}"#, escape_json(&e))),
+        },
+        Err(e) => (400, "Bad Request", format!(r#"{{"error":"{}"}}"#, escape_json(&e))),
+    }
 }
 
 fn route_table_insert(
@@ -467,6 +714,7 @@ fn route_table_insert(
     body: &str,
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -503,7 +751,7 @@ fn route_table_insert(
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, &refs))
+    ok(exec_simple(store, broker, cache, &refs))
 }
 
 fn route_table_update(
@@ -512,6 +760,7 @@ fn route_table_update(
     body: &str,
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -547,7 +796,7 @@ fn route_table_update(
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, &refs))
+    ok(exec_simple(store, broker, cache, &refs))
 }
 
 // ── Time Series handlers ──
@@ -557,6 +806,7 @@ fn route_ts_range(
     params: &[(String, String)],
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let from = get_param(params, "from").unwrap_or("-");
     let to = get_param(params, "to").unwrap_or("+");
@@ -582,7 +832,7 @@ fn route_ts_range(
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, &refs))
+    ok(exec_simple(store, broker, cache, &refs))
 }
 
 fn route_ts_add(
@@ -590,6 +840,7 @@ fn route_ts_add(
     body: &str,
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -631,7 +882,7 @@ fn route_ts_add(
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, &refs))
+    ok(exec_simple(store, broker, cache, &refs))
 }
 
 // ── Vector handlers ──
@@ -641,6 +892,7 @@ fn route_vector_set(
     body: &str,
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -676,13 +928,14 @@ fn route_vector_set(
     }
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, &refs))
+    ok(exec_simple(store, broker, cache, &refs))
 }
 
 fn route_vector_search(
     body: &str,
     store: &Arc<Store>,
     broker: &Broker,
+    cache: &SharedSchemaCache,
 ) -> (u16, &'static str, String) {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -727,12 +980,12 @@ fn route_vector_search(
     args.push("META".to_string());
 
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    ok(exec_simple(store, broker, &refs))
+    ok(exec_simple(store, broker, cache, &refs))
 }
 
 // ── Command execution ──
 
-fn handle_exec(body: &str, store: &Arc<Store>, broker: &Broker) -> String {
+fn handle_exec(body: &str, store: &Arc<Store>, broker: &Broker, cache: &SharedSchemaCache) -> String {
     let parsed: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return r#"{"error":"invalid json"}"#.to_string(),
@@ -754,17 +1007,133 @@ fn handle_exec(body: &str, store: &Arc<Store>, broker: &Broker) -> String {
     exec_simple(
         store,
         broker,
+        cache,
         &command.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
     )
 }
 
-fn exec_simple(store: &Arc<Store>, broker: &Broker, args: &[&str]) -> String {
+// ---------------------------------------------------------------------------
+// Direct JSON serialization - bypasses RESP entirely
+// ---------------------------------------------------------------------------
+
+/// Serialize a SelectResult straight to JSON without touching RESP.
+fn select_result_to_json(result: crate::tables::SelectResult) -> String {
+    match result {
+        crate::tables::SelectResult::Rows(rows) => {
+            let mut out = String::with_capacity(rows.len() * 64);
+            out.push_str(r#"{"result":["#);
+            let mut first_row = true;
+            for row in rows {
+                if !first_row { out.push(','); }
+                first_row = false;
+                out.push('{');
+                let mut first_col = true;
+                for (k, v) in &row {
+                    if !first_col { out.push(','); }
+                    first_col = false;
+                    out.push('"');
+                    push_escaped(&mut out, k);
+                    out.push_str(r#"":"#);
+                    // Try to emit numbers unquoted, everything else quoted
+                    if looks_numeric(v) {
+                        out.push_str(v);
+                    } else if v == "true" || v == "false" {
+                        out.push_str(v);
+                    } else {
+                        out.push('"');
+                        push_escaped(&mut out, v);
+                        out.push('"');
+                    }
+                }
+                out.push('}');
+            }
+            out.push_str("]}");
+            out
+        }
+        crate::tables::SelectResult::Aggregate(row) => {
+            let mut out = String::with_capacity(128);
+            out.push_str(r#"{"result":{"#);
+            let mut first = true;
+            for (k, v) in &row {
+                if !first { out.push(','); }
+                first = false;
+                out.push('"');
+                push_escaped(&mut out, k);
+                out.push_str(r#"":"#);
+                if looks_numeric(v) {
+                    out.push_str(v);
+                } else {
+                    out.push('"');
+                    push_escaped(&mut out, v);
+                    out.push('"');
+                }
+            }
+            out.push_str("}}");
+            out
+        }
+    }
+}
+
+/// Serialize a single row (from table_get) as a JSON object.
+fn row_to_json_object(row: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(row.len() * 32);
+    out.push_str(r#"{"result":{"#);
+    let mut first = true;
+    for (k, v) in row {
+        if !first { out.push(','); }
+        first = false;
+        out.push('"');
+        push_escaped(&mut out, k);
+        out.push_str(r#"":"#);
+        if looks_numeric(v) {
+            out.push_str(v);
+        } else if v == "true" || v == "false" {
+            out.push_str(v);
+        } else {
+            out.push('"');
+            push_escaped(&mut out, v);
+            out.push('"');
+        }
+    }
+    out.push_str("}}");
+    out
+}
+
+/// Push a string into out with JSON escaping, no allocations.
+#[inline]
+fn push_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str(r#"\""#),
+            '\\' => out.push_str(r#"\\"#),
+            '\n' => out.push_str(r#"\n"#),
+            '\r' => out.push_str(r#"\r"#),
+            '\t' => out.push_str(r#"\t"#),
+            c if (c as u32) < 32 => {
+                out.push_str(&format!(r#"\u{:04x}"#, c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// Returns true if s looks like a JSON number (integer or float).
+#[inline]
+fn looks_numeric(s: &str) -> bool {
+    if s.is_empty() { return false; }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if first != '-' && !first.is_ascii_digit() { return false; }
+    chars.all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-')
+}
+
+fn exec_simple(store: &Arc<Store>, broker: &Broker, cache: &SharedSchemaCache, args: &[&str]) -> String {
     let arg_bytes: Vec<&[u8]> = args.iter().map(|s| s.as_bytes() as &[u8]).collect();
     let mut out = BytesMut::with_capacity(1024);
     let now = Instant::now();
 
     let _guard = crate::SCRIPT_GATE.read();
-    let result = cmd::execute(store, broker, &arg_bytes, &mut out, now);
+    let result = cmd::execute(store, cache, broker, &arg_bytes, &mut out, now);
 
     match result {
         cmd::CmdResult::Written => resp_to_json(&out),

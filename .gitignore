@@ -1,6 +1,5 @@
 /target
 /cli/target
-cli/.env
 *.dat
 *.dat.tmp
 sdk/node_modules/
@@ -9,3 +8,9 @@ sdk/dist/
 # nix
 /result
 examples/*/node_modules/
+
+# secrets
+.env
+.env.*
+**/.env
+**/.env.*

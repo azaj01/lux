@@ -157,10 +157,8 @@ pub fn execute(
     }
 
     match cmd[0].to_ascii_uppercase() {
-        b'A' => {
-            if cmd_eq(cmd, b"APPEND") {
-                return strings::cmd_append(args, store, out, now);
-            }
+        b'A' if cmd_eq(cmd, b"APPEND") => {
+            return strings::cmd_append(args, store, out, now);
         }
         b'B' => {
             if cmd_eq(cmd, b"BLPOP") || cmd_eq(cmd, b"BRPOP") {
@@ -442,10 +440,8 @@ pub fn execute(
                 return CmdResult::Written;
             }
         }
-        b'O' => {
-            if cmd_eq(cmd, b"OBJECT") {
-                return keys::cmd_object(args, store, out, now);
-            }
+        b'O' if cmd_eq(cmd, b"OBJECT") => {
+            return keys::cmd_object(args, store, out, now);
         }
         b'P' => {
             if cmd_eq(cmd, b"PING") {
@@ -492,10 +488,8 @@ pub fn execute(
                 return pubsub::cmd_punsubscribe(args, store, out, now);
             }
         }
-        b'Q' => {
-            if cmd_eq(cmd, b"QUIT") {
-                return server::cmd_quit(args, store, out, now);
-            }
+        b'Q' if cmd_eq(cmd, b"QUIT") => {
+            return server::cmd_quit(args, store, out, now);
         }
         b'R' => {
             if cmd_eq(cmd, b"RPUSH") {

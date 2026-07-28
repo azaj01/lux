@@ -710,6 +710,8 @@ Every push and pull request runs:
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --all-targets`
 - Integration tests against the Valkey test harness
+- CLI end-to-end tests against a real encrypted engine for migration failure
+  repair and APNs/VAPID configuration lifecycle
 
 Release and Docker builds only proceed after tests pass.
 

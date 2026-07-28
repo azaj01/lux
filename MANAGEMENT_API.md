@@ -67,3 +67,19 @@ VAPID enable is idempotent; rotate intentionally changes the public key.
 Provider private keys are written only to `ENCRYPTED` columns. Legacy plaintext
 keys remain readable until encryption is available, are reported as unhealthy,
 and are migrated in-engine as soon as an active encryption key exists.
+
+The CLI exposes the same contract for an implicit local engine or a positional
+Cloud project:
+
+```text
+lux push status [project] [--check] [--output json]
+lux push apns set [project] --team-id ... --key-id ... --topic ... [--p8-file ...]
+lux push apns clear [project] --yes
+lux push vapid enable [project] [--subject ...]
+lux push vapid rotate [project] [--subject ...] --yes
+lux push vapid disable [project] --yes
+```
+
+Cloud's authenticated `/push/:project/config` routes are pass-throughs to these
+engine endpoints. The CLI reads APNs key material only from the requested file,
+never persists it, and never includes provider private keys in status output.

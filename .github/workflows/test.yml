@@ -29,3 +29,12 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo build --release
+
+  cli-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --bin lux
+      - run: cargo build --manifest-path cli/Cargo.toml
+      - run: bash cli/tests/e2e-local.sh

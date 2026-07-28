@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -189,6 +189,11 @@ enum Commands {
         #[arg(short = 'o', long, help = "Output format (json)")]
         output: Option<String>,
     },
+    /// Configure APNs and Web Push for a local or cloud project.
+    Push {
+        #[command(subcommand)]
+        action: PushAction,
+    },
     Seed {
         #[command(subcommand)]
         action: SeedAction,
@@ -295,6 +300,105 @@ enum UpdateAction {
         #[arg(long, help = "Check without installing")]
         check: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum PushAction {
+    /// Show secret-free provider configuration and health.
+    Status {
+        #[command(flatten)]
+        conn: PushConn,
+        #[arg(long, help = "Exit 1 when configured credentials are unhealthy")]
+        check: bool,
+        #[arg(short = 'o', long, help = "Output format (json)")]
+        output: Option<String>,
+    },
+    /// Configure Apple Push Notification service.
+    Apns {
+        #[command(subcommand)]
+        action: PushApnsAction,
+    },
+    /// Configure browser Web Push (VAPID).
+    Vapid {
+        #[command(subcommand)]
+        action: PushVapidAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PushApnsAction {
+    /// Set APNs metadata and optionally load a .p8 private key from disk.
+    Set {
+        #[command(flatten)]
+        conn: PushConn,
+        #[arg(long)]
+        team_id: String,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        topic: String,
+        #[arg(long, value_enum, default_value = "sandbox")]
+        environment: PushEnvironment,
+        #[arg(long, value_name = "PATH", help = "APNs PKCS8 .p8 file")]
+        p8_file: Option<PathBuf>,
+    },
+    /// Remove APNs credentials for an app.
+    Clear {
+        #[command(flatten)]
+        conn: PushConn,
+        #[arg(long, help = "Acknowledge APNs delivery will stop")]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PushVapidAction {
+    /// Enable Web Push idempotently, preserving an existing keypair.
+    Enable {
+        #[command(flatten)]
+        conn: PushConn,
+        #[arg(long, default_value = "mailto:push@luxdb.dev")]
+        subject: String,
+    },
+    /// Rotate the keypair; existing browser subscriptions must resubscribe.
+    Rotate {
+        #[command(flatten)]
+        conn: PushConn,
+        #[arg(long, default_value = "mailto:push@luxdb.dev")]
+        subject: String,
+        #[arg(long, help = "Acknowledge existing subscriptions will be invalidated")]
+        yes: bool,
+    },
+    /// Disable Web Push for an app.
+    Disable {
+        #[command(flatten)]
+        conn: PushConn,
+        #[arg(long, help = "Acknowledge Web Push delivery will stop")]
+        yes: bool,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PushEnvironment {
+    Sandbox,
+    Production,
+}
+
+impl PushEnvironment {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sandbox => "sandbox",
+            Self::Production => "production",
+        }
+    }
+}
+
+#[derive(Args)]
+struct PushConn {
+    #[arg(help = "Cloud project name or ID (omit for the local engine)")]
+    project: Option<String>,
+    #[arg(long, default_value = "default")]
+    app_id: String,
 }
 
 /// Shared target + directory args for `status`/`run`/`pull`. Kept flat so a
@@ -1482,6 +1586,274 @@ enum MigrationRepairRequest {
     Abandon,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PushProviderConfig {
+    configured: bool,
+    #[serde(default)]
+    team_id: String,
+    #[serde(default)]
+    key_id: String,
+    #[serde(default)]
+    topic: String,
+    #[serde(default)]
+    environment: String,
+    #[serde(default)]
+    public_key: String,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    secret_storage: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PushConfigStatus {
+    app_id: String,
+    healthy: bool,
+    encryption_available: bool,
+    #[serde(default)]
+    warnings: Vec<String>,
+    apns: PushProviderConfig,
+    vapid: PushProviderConfig,
+}
+
+#[derive(Deserialize)]
+struct EnginePushConfigResponse {
+    config: PushConfigStatus,
+}
+
+enum PushTarget {
+    Local {
+        client: reqwest::Client,
+        base_url: String,
+        operator_key: String,
+    },
+    Cloud {
+        client: reqwest::Client,
+        api_url: String,
+        token: String,
+        instance_id: String,
+    },
+}
+
+impl PushTarget {
+    async fn config(&self, app_id: &str) -> Result<PushConfigStatus, String> {
+        match self {
+            Self::Local {
+                client,
+                base_url,
+                operator_key,
+            } => {
+                let url = push_url(base_url, "/v1/push/config", app_id)?;
+                let response: EnginePushConfigResponse =
+                    direct_push_request(client, reqwest::Method::GET, url, operator_key, None)
+                        .await?;
+                Ok(response.config)
+            }
+            Self::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => {
+                let url = push_url(api_url, &format!("/push/{instance_id}/config"), app_id)?;
+                cloud_management_request(client, reqwest::Method::GET, url, token, None).await
+            }
+        }
+    }
+
+    async fn update_apns(
+        &self,
+        app_id: &str,
+        team_id: &str,
+        key_id: &str,
+        topic: &str,
+        environment: PushEnvironment,
+        p8_pem: Option<&str>,
+    ) -> Result<PushConfigStatus, String> {
+        let mut payload = serde_json::json!({
+            "app_id": app_id,
+            "team_id": team_id,
+            "key_id": key_id,
+            "topic": topic,
+            "environment": environment.as_str(),
+        });
+        if let Some(p8_pem) = p8_pem {
+            payload["p8_pem"] = serde_json::Value::String(p8_pem.to_string());
+        }
+        match self {
+            Self::Local {
+                client,
+                base_url,
+                operator_key,
+            } => {
+                let response: EnginePushConfigResponse = direct_push_request(
+                    client,
+                    reqwest::Method::PUT,
+                    format!("{}/v1/push/config/apns", base_url.trim_end_matches('/')),
+                    operator_key,
+                    Some(payload),
+                )
+                .await?;
+                Ok(response.config)
+            }
+            Self::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => {
+                cloud_management_request(
+                    client,
+                    reqwest::Method::PUT,
+                    format!("{api_url}/push/{instance_id}/config/apns"),
+                    token,
+                    Some(payload),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn clear_apns(&self, app_id: &str) -> Result<PushConfigStatus, String> {
+        self.delete_config("/v1/push/config/apns", "apns", app_id)
+            .await
+    }
+
+    async fn configure_vapid(
+        &self,
+        app_id: &str,
+        action: &str,
+        subject: &str,
+    ) -> Result<PushConfigStatus, String> {
+        let payload = serde_json::json!({
+            "app_id": app_id,
+            "action": action,
+            "subject": subject,
+        });
+        match self {
+            Self::Local {
+                client,
+                base_url,
+                operator_key,
+            } => {
+                direct_push_request::<serde_json::Value>(
+                    client,
+                    reqwest::Method::POST,
+                    format!("{}/v1/push/config/vapid", base_url.trim_end_matches('/')),
+                    operator_key,
+                    Some(payload),
+                )
+                .await?;
+                self.config(app_id).await
+            }
+            Self::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => {
+                cloud_management_request(
+                    client,
+                    reqwest::Method::POST,
+                    format!("{api_url}/push/{instance_id}/config/vapid"),
+                    token,
+                    Some(payload),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn disable_vapid(&self, app_id: &str) -> Result<PushConfigStatus, String> {
+        self.delete_config("/v1/push/config/vapid", "vapid", app_id)
+            .await
+    }
+
+    async fn delete_config(
+        &self,
+        local_path: &str,
+        cloud_provider: &str,
+        app_id: &str,
+    ) -> Result<PushConfigStatus, String> {
+        match self {
+            Self::Local {
+                client,
+                base_url,
+                operator_key,
+            } => {
+                let url = push_url(base_url, local_path, app_id)?;
+                direct_push_request::<serde_json::Value>(
+                    client,
+                    reqwest::Method::DELETE,
+                    url,
+                    operator_key,
+                    None,
+                )
+                .await?;
+                self.config(app_id).await
+            }
+            Self::Cloud {
+                client,
+                api_url,
+                token,
+                instance_id,
+            } => {
+                let url = push_url(
+                    api_url,
+                    &format!("/push/{instance_id}/config/{cloud_provider}"),
+                    app_id,
+                )?;
+                cloud_management_request(client, reqwest::Method::DELETE, url, token, None).await
+            }
+        }
+    }
+}
+
+fn push_url(base_url: &str, path: &str, app_id: &str) -> Result<String, String> {
+    let mut url = reqwest::Url::parse(&format!("{}{}", base_url.trim_end_matches('/'), path))
+        .map_err(|e| format!("invalid push configuration URL: {e}"))?;
+    url.query_pairs_mut().append_pair("app_id", app_id);
+    Ok(url.to_string())
+}
+
+async fn direct_push_request<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    url: String,
+    operator_key: &str,
+    payload: Option<serde_json::Value>,
+) -> Result<T, String> {
+    let mut request = client
+        .request(method, url)
+        .header("Authorization", format!("Bearer {operator_key}"));
+    if let Some(payload) = payload {
+        request = request.json(&payload);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("engine push request failed: {e}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| format!("engine push response could not be read: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "engine push API returned invalid JSON (HTTP {}): {e}",
+            status.as_u16()
+        )
+    })?;
+    if !status.is_success() {
+        return Err(value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("engine push configuration failed")
+            .to_string());
+    }
+    serde_json::from_value(value).map_err(|e| format!("invalid engine push response: {e}"))
+}
+
 #[derive(Deserialize, Debug)]
 struct Instance {
     id: String,
@@ -1835,6 +2207,112 @@ async fn get_project_detail(
         None,
     )
     .await
+}
+
+async fn resolve_push_target(
+    project: Option<&str>,
+    api_url_override: &Option<String>,
+) -> PushTarget {
+    if let Some(project) = explicit_project(project) {
+        let (client, api_url, token) = get_client(api_url_override);
+        let instance = find_project(&client, &api_url, &token, project).await;
+        if instance.status != "running" {
+            eprintln!(
+                "{} Cloud project '{}' is {}.",
+                "Error:".red(),
+                instance.name,
+                instance.status
+            );
+            std::process::exit(1);
+        }
+        return PushTarget::Cloud {
+            client,
+            api_url,
+            token,
+            instance_id: instance.id,
+        };
+    }
+    let state = load_local_state().unwrap_or_else(|| {
+        eprintln!(
+            "{} No local engine state. Run {} first.",
+            "Error:".red(),
+            "lux start".cyan()
+        );
+        std::process::exit(1);
+    });
+    PushTarget::Local {
+        client: reqwest::Client::new(),
+        base_url: state.lux_url(),
+        operator_key: state.password,
+    }
+}
+
+fn print_push_config(config: &PushConfigStatus, output: Option<&str>) {
+    if output == Some("json") {
+        println!("{}", serde_json::to_string_pretty(config).unwrap());
+        return;
+    }
+    println!(
+        "{} {} ({})",
+        "Push config:".bold(),
+        config.app_id,
+        if config.healthy {
+            "healthy".green().to_string()
+        } else {
+            "unhealthy".red().to_string()
+        }
+    );
+    println!(
+        "{} {}",
+        "Encryption:".bold(),
+        if config.encryption_available {
+            "available".green().to_string()
+        } else {
+            "unavailable".red().to_string()
+        }
+    );
+    println!(
+        "{} {}",
+        "APNs:".bold(),
+        if config.apns.configured {
+            format!(
+                "configured — {} / {} ({}, {})",
+                config.apns.team_id,
+                config.apns.topic,
+                config.apns.environment,
+                config.apns.secret_storage
+            )
+        } else {
+            "not configured".to_string()
+        }
+    );
+    println!(
+        "{} {}",
+        "Web Push:".bold(),
+        if config.vapid.configured {
+            format!(
+                "configured — {} ({})",
+                config.vapid.subject, config.vapid.secret_storage
+            )
+        } else {
+            "not configured".to_string()
+        }
+    );
+    if config.vapid.configured && !config.vapid.public_key.is_empty() {
+        println!("{} {}", "VAPID public key:".bold(), config.vapid.public_key);
+    }
+    for warning in &config.warnings {
+        println!("{} {warning}", "Warning:".yellow());
+    }
+}
+
+fn read_apns_key(path: &Path) -> Result<String, String> {
+    let key = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read APNs key {}: {e}", path.display()))?;
+    if !key.contains("-----BEGIN PRIVATE KEY-----") || !key.contains("-----END PRIVATE KEY-----") {
+        return Err("APNs key must be a PKCS8 PEM .p8 private key".to_string());
+    }
+    Ok(key)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3688,6 +4166,163 @@ pub async fn run() {
                 std::process::exit(1);
             }
         }
+
+        Commands::Push { action } => match action {
+            PushAction::Status {
+                conn,
+                check,
+                output,
+            } => {
+                if output.is_some() && output.as_deref() != Some("json") {
+                    eprintln!("{} Supported push status output is `json`.", "Error:".red());
+                    std::process::exit(1);
+                }
+                let target = resolve_push_target(conn.project.as_deref(), &api_url_override).await;
+                let config = target.config(&conn.app_id).await.unwrap_or_else(|error| {
+                    eprintln!("{} {error}", "Push status failed:".red());
+                    std::process::exit(1);
+                });
+                print_push_config(&config, output.as_deref());
+                if check && !config.healthy {
+                    std::process::exit(1);
+                }
+            }
+            PushAction::Apns { action } => match action {
+                PushApnsAction::Set {
+                    conn,
+                    team_id,
+                    key_id,
+                    topic,
+                    environment,
+                    p8_file,
+                } => {
+                    let p8_pem = p8_file
+                        .as_deref()
+                        .map(read_apns_key)
+                        .transpose()
+                        .unwrap_or_else(|error| {
+                            eprintln!("{} {error}", "APNs configuration failed:".red());
+                            std::process::exit(1);
+                        });
+                    let target =
+                        resolve_push_target(conn.project.as_deref(), &api_url_override).await;
+                    let config = target
+                        .update_apns(
+                            &conn.app_id,
+                            &team_id,
+                            &key_id,
+                            &topic,
+                            environment,
+                            p8_pem.as_deref(),
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            eprintln!("{} {error}", "APNs configuration failed:".red());
+                            std::process::exit(1);
+                        });
+                    println!(
+                        "{} APNs configured for app '{}'; private key material was not stored by the CLI.",
+                        "Done.".green(),
+                        conn.app_id
+                    );
+                    print_push_config(&config, None);
+                }
+                PushApnsAction::Clear { conn, yes } => {
+                    if !yes {
+                        eprintln!(
+                            "{} Add {} to acknowledge APNs delivery will stop.",
+                            "Refusing:".red(),
+                            "--yes".cyan()
+                        );
+                        std::process::exit(1);
+                    }
+                    let target =
+                        resolve_push_target(conn.project.as_deref(), &api_url_override).await;
+                    let config = target
+                        .clear_apns(&conn.app_id)
+                        .await
+                        .unwrap_or_else(|error| {
+                            eprintln!("{} {error}", "APNs clear failed:".red());
+                            std::process::exit(1);
+                        });
+                    println!(
+                        "{} APNs disabled for app '{}'.",
+                        "Done.".green(),
+                        conn.app_id
+                    );
+                    print_push_config(&config, None);
+                }
+            },
+            PushAction::Vapid { action } => match action {
+                PushVapidAction::Enable { conn, subject } => {
+                    let target =
+                        resolve_push_target(conn.project.as_deref(), &api_url_override).await;
+                    let config = target
+                        .configure_vapid(&conn.app_id, "enable", &subject)
+                        .await
+                        .unwrap_or_else(|error| {
+                            eprintln!("{} {error}", "Web Push configuration failed:".red());
+                            std::process::exit(1);
+                        });
+                    println!(
+                        "{} Web Push enabled for app '{}'.",
+                        "Done.".green(),
+                        conn.app_id
+                    );
+                    print_push_config(&config, None);
+                }
+                PushVapidAction::Rotate { conn, subject, yes } => {
+                    if !yes {
+                        eprintln!(
+                            "{} Add {} to acknowledge existing browser subscriptions must resubscribe.",
+                            "Refusing:".red(),
+                            "--yes".cyan()
+                        );
+                        std::process::exit(1);
+                    }
+                    let target =
+                        resolve_push_target(conn.project.as_deref(), &api_url_override).await;
+                    let config = target
+                        .configure_vapid(&conn.app_id, "rotate", &subject)
+                        .await
+                        .unwrap_or_else(|error| {
+                            eprintln!("{} {error}", "VAPID rotation failed:".red());
+                            std::process::exit(1);
+                        });
+                    println!(
+                        "{} VAPID rotated for app '{}'; existing subscriptions must resubscribe.",
+                        "Done.".green(),
+                        conn.app_id
+                    );
+                    print_push_config(&config, None);
+                }
+                PushVapidAction::Disable { conn, yes } => {
+                    if !yes {
+                        eprintln!(
+                            "{} Add {} to acknowledge Web Push delivery will stop.",
+                            "Refusing:".red(),
+                            "--yes".cyan()
+                        );
+                        std::process::exit(1);
+                    }
+                    let target =
+                        resolve_push_target(conn.project.as_deref(), &api_url_override).await;
+                    let config = target
+                        .disable_vapid(&conn.app_id)
+                        .await
+                        .unwrap_or_else(|error| {
+                            eprintln!("{} {error}", "Web Push disable failed:".red());
+                            std::process::exit(1);
+                        });
+                    println!(
+                        "{} Web Push disabled for app '{}'.",
+                        "Done.".green(),
+                        conn.app_id
+                    );
+                    print_push_config(&config, None);
+                }
+            },
+        },
 
         Commands::Migrate { action, run } => match action.unwrap_or(MigrateAction::Run(run)) {
             MigrateAction::New { name, dir } => {
@@ -6513,6 +7148,83 @@ mod tests {
             }
             _ => panic!("expected Version"),
         }
+    }
+
+    #[test]
+    fn push_commands_keep_local_implicit_and_cloud_positional() {
+        let cli = Cli::try_parse_from(["lux", "push", "status", "--app-id", "ios"])
+            .expect("local push status parses");
+        match cli.command {
+            Commands::Push {
+                action: PushAction::Status { conn, .. },
+            } => {
+                assert!(conn.project.is_none());
+                assert_eq!(conn.app_id, "ios");
+            }
+            _ => panic!("expected Push::Status"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "lux",
+            "push",
+            "apns",
+            "set",
+            "dialog",
+            "--team-id",
+            "TEAM",
+            "--key-id",
+            "KEY",
+            "--topic",
+            "dev.lux.app",
+            "--environment",
+            "production",
+            "--p8-file",
+            "AuthKey.p8",
+        ])
+        .expect("cloud APNs setup parses");
+        match cli.command {
+            Commands::Push {
+                action:
+                    PushAction::Apns {
+                        action:
+                            PushApnsAction::Set {
+                                conn,
+                                environment,
+                                p8_file,
+                                ..
+                            },
+                    },
+            } => {
+                assert_eq!(conn.project.as_deref(), Some("dialog"));
+                assert!(matches!(environment, PushEnvironment::Production));
+                assert_eq!(p8_file.as_deref(), Some(Path::new("AuthKey.p8")));
+            }
+            _ => panic!("expected Push::Apns::Set"),
+        }
+    }
+
+    #[test]
+    fn destructive_push_commands_require_runtime_acknowledgement() {
+        let cli = Cli::try_parse_from(["lux", "push", "vapid", "rotate", "--yes"])
+            .expect("VAPID rotate parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Push {
+                action: PushAction::Vapid {
+                    action: PushVapidAction::Rotate { yes: true, .. }
+                }
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["lux", "push", "apns", "clear"]).expect("APNs clear parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Push {
+                action: PushAction::Apns {
+                    action: PushApnsAction::Clear { yes: false, .. }
+                }
+            }
+        ));
     }
 
     #[test]

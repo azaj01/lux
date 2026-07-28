@@ -84,6 +84,8 @@ lux migrate status                            # check status (local instance)
 lux migrate plan                              # preview without applying
 lux migrate run                               # run pending migrations (local instance)
 lux migrate run my-app                        # run against a cloud project
+lux push status                               # local push config and health
+lux push status my-app                        # cloud push config and health
 lux seed run                                  # run lux/seed.lux against local
 lux seed run my-app                           # run against explicit cloud
 lux types                                     # generate TypeScript types from your schema
@@ -232,6 +234,42 @@ lux update studio                  # local Studio
 local env profile from existing local state. It never starts, stops, updates,
 migrates, repairs, rotates credentials, or changes the active app target.
 
+## Push configuration
+
+Push configuration has the same target rule as migrations: omitted means local;
+a positional project means cloud. Status is secret-free. APNs keys are read from
+a file and sent directly to the engine-owned encrypted configuration—the CLI
+never writes them to its config or prints them.
+
+```bash
+lux push status
+lux push status my-app --check
+lux push status --output json
+
+lux push apns set \
+  --team-id TEAM_ID \
+  --key-id KEY_ID \
+  --topic com.example.app \
+  --environment sandbox \
+  --p8-file AuthKey_KEY_ID.p8
+
+# Metadata-only updates preserve the existing encrypted .p8 key
+lux push apns set my-app \
+  --team-id TEAM_ID \
+  --key-id KEY_ID \
+  --topic com.example.app \
+  --environment production
+
+lux push vapid enable --subject mailto:push@example.com
+lux push vapid rotate --subject mailto:push@example.com --yes
+lux push vapid disable --yes
+lux push apns clear --yes
+```
+
+VAPID enable is idempotent. Rotation deliberately changes the browser-facing
+public key and therefore requires `--yes`, because existing subscriptions must
+resubscribe. Clearing either provider also requires `--yes`.
+
 ## Seeds
 
 Use `lux/seed.lux` for stable local/demo data:
@@ -277,8 +315,6 @@ lux env pull
 ```env
 LUX_PROJECT_ID=
 LUX_URL=
-LUX_AUTH_URL=
-LUX_HTTP_URL=
 LUX_PUBLISHABLE_KEY=
 LUX_SECRET_KEY=
 LUX_DIRECT_URL=

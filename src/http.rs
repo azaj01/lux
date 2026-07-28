@@ -3132,13 +3132,28 @@ fn push_register(
     };
     let platform = parsed["platform"].as_str().unwrap_or("ios");
     let app_id = parsed["app_id"].as_str().unwrap_or("default");
+    // "sandbox" or "production". Optional: an app that omits it keeps the old
+    // behaviour of routing by the project's credential.
+    let environment = parsed["environment"].as_str().unwrap_or("");
+    // A self-registering end user is not trusted to name the delivery host, and
+    // this route accepts a user's own JWT. See `normalize_environment`.
+    let environment_source = match auth {
+        HttpAuthContext::Operator | HttpAuthContext::Secret => {
+            crate::push::EnvironmentSource::Trusted
+        }
+        _ => crate::push::EnvironmentSource::User,
+    };
     match crate::push::register_device(
         store,
         cache,
-        &subject_id,
-        token,
-        platform,
-        app_id,
+        crate::push::DeviceRegistration {
+            subject_id: &subject_id,
+            token,
+            platform,
+            app_id,
+            environment,
+            environment_source,
+        },
         Instant::now(),
     ) {
         Ok(id) => ok(format!(r#"{{"id":{}}}"#, serde_json::Value::String(id))),
